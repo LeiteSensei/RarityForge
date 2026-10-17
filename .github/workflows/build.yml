@@ -1,0 +1,50 @@
+name: Compilar RarityForge
+
+# Roda sozinho toda vez que voce envia arquivos, e tambem pelo botao "Run workflow".
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-cache
+
+    steps:
+      - name: Baixar o codigo
+        uses: actions/checkout@v4
+
+      - name: Guardar cache das bibliotecas (acelera as proximas compilacoes)
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+
+      - name: Configurar
+        shell: bash
+        run: |
+          mkdir -p vcpkg-cache
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 \
+            -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake \
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static \
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded \
+            -DCMAKE_CXX_FLAGS="/permissive- /Zc:preprocessor /EHsc /MP /W4 -DWIN32_LEAN_AND_MEAN -DNOMINMAX -DUNICODE -D_UNICODE"
+
+      - name: Compilar
+        shell: bash
+        run: cmake --build build --config Release
+
+      - name: Montar o mod (pasta pronta para o MO2)
+        shell: bash
+        run: |
+          mkdir -p package/SKSE/Plugins
+          cp build/Release/RarityForge.dll package/SKSE/Plugins/
+          cp RarityForge.ini package/SKSE/Plugins/
+
+      - name: Enviar o resultado
+        uses: actions/upload-artifact@v4
+        with:
+          name: RarityForge
+          path: package
