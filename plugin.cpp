@@ -5,7 +5,7 @@
 //   2) cria uma COPIA da arma (um item novo, so do jogador);
 //   3) aplica os atributos da raridade:
 //      - dano, valor, velocidade de ataque e bonus de critico: sorteados
-//        dentro da faixa da raridade;
+//        dentro da faixa da raridade (o dano critico acompanha o dano novo);
 //      - peso: reducao FIXA por raridade (a arma fica X vezes mais leve);
 //   4) troca a arma forjada pela copia no inventario.
 //
@@ -90,7 +90,7 @@ namespace
         Range       value;      // multiplicador de valor de venda
         float       weightDiv;  // divisor do peso (fixo): 2.0 = metade do peso
         Range       speed;      // multiplicador de velocidade de ataque
-        Range       critBonus;  // bonus somado ao multiplicador de critico (1 + bonus)
+        Range       critBonus;  // bonus somado ao multiplicador do dano critico (1 + bonus)
     };
 
     struct Config
@@ -205,7 +205,7 @@ namespace
         float       damage{ 1.0f };
         float       value{ 1.0f };
         float       weightDiv{ 1.0f };  // peso dividido por isto
-        float       crit{ 1.0f };       // multiplicador final do critico (1 + bonus)
+        float       crit{ 1.0f };       // multiplicador final do DANO CRITICO (1 + bonus)
         float       speed{ 1.0f };
     };
 
@@ -232,18 +232,25 @@ namespace
         clone->attackDamage = std::max<std::uint16_t>(1, rnd16(static_cast<float>(base->attackDamage) * rec.damage));
         clone->value = std::max<std::int32_t>(1, static_cast<std::int32_t>(std::lround(static_cast<float>(base->value) * rec.value)));
         clone->weight = std::max(0.0f, base->weight / std::max(0.01f, rec.weightDiv));
-        clone->criticalData.prcntMult = base->criticalData.prcntMult * rec.crit;
+        // O dano critico acompanha o dano NOVO da arma, mantendo a proporcao que a
+        // arma original tinha (na maioria das armas e metade do dano), e so entao
+        // aplica o bonus de critico da raridade.
+        {
+            const float baseDmg = static_cast<float>(base->attackDamage);
+            const float ratio = baseDmg > 0.0f ? static_cast<float>(base->criticalData.damage) / baseDmg : 0.5f;
+            clone->criticalData.damage = rnd16(static_cast<float>(clone->attackDamage) * ratio * rec.crit);
+        }
         clone->weaponData.speed = base->weaponData.speed * rec.speed;
 
         const std::string newName = std::format("[{}] {}", rec.rarity, base->GetName());
         clone->fullName = newName.c_str();
 
-        Log("  copia {:08X} de {:08X}: nome='{}' dano {}->{} valor {}->{} peso {:.2f}->{:.2f} crit {:.2f}->{:.2f} vel {:.2f}->{:.2f} modelo='{}'",
+        Log("  copia {:08X} de {:08X}: nome='{}' dano {}->{} valor {}->{} peso {:.2f}->{:.2f} crit {}->{} vel {:.2f}->{:.2f} modelo='{}'",
             clone->GetFormID(), base->GetFormID(), newName,
             base->attackDamage, clone->attackDamage,
             base->value, clone->value,
             base->weight, clone->weight,
-            base->criticalData.prcntMult, clone->criticalData.prcntMult,
+            base->criticalData.damage, clone->criticalData.damage,
             base->weaponData.speed, clone->weaponData.speed,
             clone->GetModel() ? clone->GetModel() : "(sem modelo)");
         return true;
