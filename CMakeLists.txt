@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 # Nome do projeto = nome do arquivo .dll
-project(RarityForge VERSION 0.1.0 LANGUAGES CXX)
+project(Overgeared VERSION 0.1.0 LANGUAGES CXX)
 
 # Baseado no template oficial SKSE_Template_HelloWorld (SkyrimScripting)
 find_package(CommonLibSSE CONFIG REQUIRED)

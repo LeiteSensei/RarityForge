@@ -1,73 +1,53 @@
-// RarityForge - versao inicial (prototipo)
+// Overgeared v3 - PROTOTIPO de copias
 //
-// O que faz:
-//   Quando o jogador forja uma arma ou armadura, o plugin sorteia uma raridade
-//   (Comum, Rara, Epica, Lendaria, Mitica) e um multiplicador entre 1.00 e 5.00,
-//   e aplica no item criado:
-//     - o nome ganha uma etiqueta, ex: "[Rara] Espada de Ferro"
-//     - o multiplicador e gravado no "ExtraHealth" do item (o mesmo dado que a
-//       forja usa para o aprimoramento), que afeta dano/armadura e valor.
+// Quando o jogador forja uma ARMA, o plugin:
+//   1) sorteia uma raridade (Comum, Rara, Epica, Lendaria, Mitica);
+//   2) cria uma COPIA da arma (um item novo, so do jogador);
+//   3) aplica os atributos da raridade:
+//      - dano, valor, velocidade de ataque e bonus de critico: sorteados
+//        dentro da faixa da raridade;
+//      - peso: reducao FIXA por raridade (a arma fica X vezes mais leve);
+//   4) troca a arma forjada pela copia no inventario.
 //
-// IMPORTANTE: este codigo NAO foi compilado nem testado. Pode ter erros de
-// compilacao ou comportamento diferente do esperado. Veja o LEIAME.md.
+// Como o jogo nao grava sozinho os dados dessas copias, o plugin guarda uma
+// lista (num arquivo ao lado do save, o "cosave") e refaz os dados ao carregar.
+//
+// Nesta versao: so armas. Armaduras ficam sem raridade.
+//
+// IMPORTANTE: codigo NAO testado. Veja o texto que acompanha.
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
 
 #include <algorithm>
 #include <array>
-#include <cmath>
-#include <cstdlib>
 #include <chrono>
-#include <cstring>
+#include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <random>
 #include <string>
+#include <unordered_map>
 
 namespace
 {
     // ------------------------------------------------------------------
-    // Configuracao (lida de Data/SKSE/Plugins/RarityForge.ini)
+    // Log (grava em dois lugares para facilitar achar)
     // ------------------------------------------------------------------
-    struct RarityDef
-    {
-        std::string name;
-        float       weight;   // chance relativa
-        float       minMult;  // multiplicador minimo
-        float       maxMult;  // multiplicador maximo
-    };
-
-    struct Config
-    {
-        std::array<RarityDef, 5> rarities{ {
-            { "Comum", 60.0f, 1.00f, 1.24f },
-            { "Rara", 25.0f, 1.25f, 1.74f },
-            { "Epica", 10.0f, 1.75f, 2.99f },
-            { "Lendaria", 4.0f, 3.00f, 4.99f },
-            { "Mitica", 1.0f, 5.00f, 5.00f },
-        } };
-        bool  onlyWhenCrafting = true;
-        bool  affectWeapons = true;
-        bool  affectArmor = true;
-        bool  notify = true;
-        float healthScale = 1.0f;  // multiplica o valor gravado no ExtraHealth
-    };
-
-    Config g_cfg;
-
-
-    // ------------------------------------------------------------------
-    // Log simples: escreve e grava no disco a cada linha
-    // ------------------------------------------------------------------
-    std::ofstream g_logFile;
+    std::ofstream g_logA;  // pasta de logs do SKSE (Documentos/My Games/...)
+    std::ofstream g_logB;  // Data/SKSE/Plugins (no MO2, vai para a pasta Overwrite)
 
     void WriteLog(const std::string& s)
     {
-        if (g_logFile.is_open()) {
-            g_logFile << s << "\n";
-            g_logFile.flush();
+        if (g_logA.is_open()) {
+            g_logA << s << "\n";
+            g_logA.flush();
+        }
+        if (g_logB.is_open()) {
+            g_logB << s << "\n";
+            g_logB.flush();
         }
     }
 
@@ -77,29 +57,56 @@ namespace
         WriteLog(std::format(fmt, std::forward<Args>(args)...));
     }
 
+    void OpenLogFile(std::ofstream& stream, const std::filesystem::path& path)
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+        stream.open(path, std::ios::out | std::ios::trunc);
+    }
+
     void SetupLog()
     {
-        std::filesystem::path path;
         if (auto folder = SKSE::log::log_directory()) {
-            path = *folder / "RarityForge.log";
-        } else {
-            path = std::filesystem::path("Data") / "SKSE" / "Plugins" / "RarityForge.log";
+            OpenLogFile(g_logA, *folder / "Overgeared.log");
         }
-        g_logFile.open(path, std::ios::out | std::ios::trunc);
-        if (g_logFile.is_open()) {
-            Log("RarityForge iniciado. Log em: {}", path.string());
-        }
+        OpenLogFile(g_logB, std::filesystem::path("Data") / "SKSE" / "Plugins" / "Overgeared.log");
+        Log("Overgeared v3 (prototipo de copias) iniciado.");
     }
 
-    bool g_craftingMenuOpen = false;
-    bool g_busy = false;  // evita o plugin reagir aos proprios ajustes
-    std::chrono::steady_clock::time_point g_cooldownUntil{};  // ignora eventos logo apos um ajuste
-
-    std::mt19937& Rng()
+    // ------------------------------------------------------------------
+    // Configuracao
+    // ------------------------------------------------------------------
+    struct Range
     {
-        static std::mt19937 rng{ std::random_device{}() };
-        return rng;
-    }
+        float min;
+        float max;
+    };
+
+    struct RarityDef
+    {
+        std::string name;
+        float       chance;     // chance relativa
+        Range       damage;     // multiplicador de dano
+        Range       value;      // multiplicador de valor de venda
+        float       weightDiv;  // divisor do peso (fixo): 2.0 = metade do peso
+        Range       speed;      // multiplicador de velocidade de ataque
+        Range       critBonus;  // bonus somado ao multiplicador de critico (1 + bonus)
+    };
+
+    struct Config
+    {
+        std::array<RarityDef, 5> rarities{ {
+            { "Comum", 60.0f, { 1.00f, 1.24f }, { 1.00f, 1.10f }, 1.00f, { 1.00f, 1.24f }, { 0.00f, 0.50f } },
+            { "Rara", 25.0f, { 1.25f, 1.74f }, { 1.10f, 1.30f }, 1.25f, { 1.25f, 1.49f }, { 0.50f, 1.00f } },
+            { "Epica", 10.0f, { 1.75f, 2.99f }, { 1.30f, 1.60f }, 1.75f, { 1.50f, 1.74f }, { 1.00f, 1.50f } },
+            { "Lendaria", 4.0f, { 3.00f, 4.99f }, { 1.60f, 1.99f }, 2.25f, { 1.75f, 1.99f }, { 1.50f, 2.00f } },
+            { "Mitica", 1.0f, { 5.00f, 5.00f }, { 2.00f, 2.00f }, 3.00f, { 2.00f, 2.00f }, { 2.00f, 2.00f } },
+        } };
+        bool onlyWhenCrafting = true;
+        bool notify = true;
+    };
+
+    Config g_cfg;
 
     std::string Trim(std::string s)
     {
@@ -119,9 +126,9 @@ namespace
 
     void LoadConfig()
     {
-        std::ifstream file("Data\\SKSE\\Plugins\\RarityForge.ini");
+        std::ifstream file("Data\\SKSE\\Plugins\\Overgeared.ini");
         if (!file.is_open()) {
-            Log("RarityForge.ini nao encontrado, usando valores padrao.");
+            Log("Overgeared.ini nao encontrado, usando valores padrao.");
             return;
         }
 
@@ -139,19 +146,25 @@ namespace
             const std::string val = Trim(line.substr(eq + 1));
 
             try {
-                if (key == "OnlyWhenCrafting") g_cfg.onlyWhenCrafting = ToBool(val);
-                else if (key == "AffectWeapons") g_cfg.affectWeapons = ToBool(val);
-                else if (key == "AffectArmor") g_cfg.affectArmor = ToBool(val);
-                else if (key == "Notify") g_cfg.notify = ToBool(val);
-                else if (key == "HealthScale") g_cfg.healthScale = std::stof(val);
-                else {
-                    // Chaves por raridade: Name1, Weight1, Min1, Max1 ... Name5...
+                if (key == "OnlyWhenCrafting") {
+                    g_cfg.onlyWhenCrafting = ToBool(val);
+                } else if (key == "Notify") {
+                    g_cfg.notify = ToBool(val);
+                } else {
                     for (int i = 0; i < 5; ++i) {
                         const std::string n = std::to_string(i + 1);
-                        if (key == "Name" + n) g_cfg.rarities[i].name = val;
-                        else if (key == "Weight" + n) g_cfg.rarities[i].weight = std::stof(val);
-                        else if (key == "Min" + n) g_cfg.rarities[i].minMult = std::stof(val);
-                        else if (key == "Max" + n) g_cfg.rarities[i].maxMult = std::stof(val);
+                        auto&             r = g_cfg.rarities[i];
+                        if (key == "Name" + n) r.name = val;
+                        else if (key == "Chance" + n) r.chance = std::stof(val);
+                        else if (key == "DamageMin" + n) r.damage.min = std::stof(val);
+                        else if (key == "DamageMax" + n) r.damage.max = std::stof(val);
+                        else if (key == "ValueMin" + n) r.value.min = std::stof(val);
+                        else if (key == "ValueMax" + n) r.value.max = std::stof(val);
+                        else if (key == "WeightDivisor" + n) r.weightDiv = std::stof(val);
+                        else if (key == "CritBonusMin" + n) r.critBonus.min = std::stof(val);
+                        else if (key == "CritBonusMax" + n) r.critBonus.max = std::stof(val);
+                        else if (key == "SpeedMin" + n) r.speed.min = std::stof(val);
+                        else if (key == "SpeedMax" + n) r.speed.max = std::stof(val);
                     }
                 }
             } catch (...) {
@@ -164,25 +177,227 @@ namespace
     // ------------------------------------------------------------------
     // Sorteio
     // ------------------------------------------------------------------
-    struct RollResult
+    std::mt19937& Rng()
     {
-        std::string name;
-        float       multiplier;
+        static std::mt19937 rng{ std::random_device{}() };
+        return rng;
+    }
+
+    // sorteia em passos de 0.01 dentro da faixa
+    float RollRange(const Range& r)
+    {
+        const int lo = static_cast<int>(std::lround(r.min * 100.0f));
+        const int hi = static_cast<int>(std::lround(r.max * 100.0f));
+        if (hi <= lo) {
+            return static_cast<float>(lo) / 100.0f;
+        }
+        std::uniform_int_distribution<int> step(lo, hi);
+        return static_cast<float>(step(Rng())) / 100.0f;
+    }
+
+    // ------------------------------------------------------------------
+    // Registro das copias (o que precisa sobreviver ao salvar/carregar)
+    // ------------------------------------------------------------------
+    struct CloneRecord
+    {
+        RE::FormID  baseID{ 0 };
+        std::string rarity;
+        float       damage{ 1.0f };
+        float       value{ 1.0f };
+        float       weightDiv{ 1.0f };  // peso dividido por isto
+        float       crit{ 1.0f };       // multiplicador final do critico (1 + bonus)
+        float       speed{ 1.0f };
     };
 
-    RollResult Roll()
+    std::unordered_map<RE::FormID, CloneRecord> g_clones;  // chave: FormID da copia
+
+    // Preenche (ou refaz) a copia a partir da arma original + multiplicadores.
+    bool BuildClone(RE::TESObjectWEAP* clone, RE::TESObjectWEAP* base, const CloneRecord& rec)
     {
-        float total = 0.0f;
-        for (auto& r : g_cfg.rarities) {
-            total += std::max(0.0f, r.weight);
+        if (!clone || !base) {
+            return false;
         }
 
+        const RE::FormID idBefore = clone->GetFormID();
+        clone->Copy(base);
+        const RE::FormID idAfter = clone->GetFormID();
+        if (idBefore != idAfter) {
+            Log("  AVISO: o FormID da copia mudou durante o Copy ({:08X} -> {:08X})", idBefore, idAfter);
+        }
+
+        auto rnd16 = [](float v) {
+            return static_cast<std::uint16_t>(std::clamp<long>(std::lround(v), 0L, 65535L));
+        };
+
+        clone->attackDamage = std::max<std::uint16_t>(1, rnd16(static_cast<float>(base->attackDamage) * rec.damage));
+        clone->value = std::max<std::int32_t>(1, static_cast<std::int32_t>(std::lround(static_cast<float>(base->value) * rec.value)));
+        clone->weight = std::max(0.0f, base->weight / std::max(0.01f, rec.weightDiv));
+        clone->criticalData.prcntMult = base->criticalData.prcntMult * rec.crit;
+        clone->weaponData.speed = base->weaponData.speed * rec.speed;
+
+        const std::string newName = std::format("[{}] {}", rec.rarity, base->GetName());
+        clone->fullName = newName.c_str();
+
+        Log("  copia {:08X} de {:08X}: nome='{}' dano {}->{} valor {}->{} peso {:.2f}->{:.2f} crit {:.2f}->{:.2f} vel {:.2f}->{:.2f} modelo='{}'",
+            clone->GetFormID(), base->GetFormID(), newName,
+            base->attackDamage, clone->attackDamage,
+            base->value, clone->value,
+            base->weight, clone->weight,
+            base->criticalData.prcntMult, clone->criticalData.prcntMult,
+            base->weaponData.speed, clone->weaponData.speed,
+            clone->GetModel() ? clone->GetModel() : "(sem modelo)");
+        return true;
+    }
+
+    void RepopulateAll(const char* reason)
+    {
+        Log("Refazendo copias ({}): {} registradas.", reason, g_clones.size());
+        for (auto& [cloneID, rec] : g_clones) {
+            auto* clone = RE::TESForm::LookupByID<RE::TESObjectWEAP>(cloneID);
+            auto* base = RE::TESForm::LookupByID<RE::TESObjectWEAP>(rec.baseID);
+            if (!clone) {
+                Log("  copia {:08X} nao existe mais no jogo (ignorada).", cloneID);
+                continue;
+            }
+            if (!base) {
+                Log("  arma original {:08X} nao encontrada (mod removido?). Copia {:08X} ignorada.", rec.baseID, cloneID);
+                continue;
+            }
+            BuildClone(clone, base, rec);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Gravacao junto do save (cosave)
+    // ------------------------------------------------------------------
+    constexpr std::uint32_t kUniqueID = 'OVG1';
+    constexpr std::uint32_t kRecordClones = 'CLON';
+    constexpr std::uint32_t kRecordVersion = 1;
+
+    void SaveCallback(SKSE::SerializationInterface* intfc)
+    {
+        if (!intfc->OpenRecord(kRecordClones, kRecordVersion)) {
+            Log("ERRO: nao foi possivel abrir o registro do cosave.");
+            return;
+        }
+        const std::uint32_t count = static_cast<std::uint32_t>(g_clones.size());
+        intfc->WriteRecordData(count);
+        for (auto& [cloneID, rec] : g_clones) {
+            intfc->WriteRecordData(cloneID);
+            intfc->WriteRecordData(rec.baseID);
+            intfc->WriteRecordData(rec.damage);
+            intfc->WriteRecordData(rec.value);
+            intfc->WriteRecordData(rec.weightDiv);
+            intfc->WriteRecordData(rec.crit);
+            intfc->WriteRecordData(rec.speed);
+            const std::uint32_t len = static_cast<std::uint32_t>(rec.rarity.size());
+            intfc->WriteRecordData(len);
+            if (len > 0) {
+                intfc->WriteRecordData(rec.rarity.data(), len);
+            }
+        }
+        Log("Cosave gravado: {} copias.", count);
+    }
+
+    void LoadCallback(SKSE::SerializationInterface* intfc)
+    {
+        g_clones.clear();
+
+        std::uint32_t type = 0, version = 0, length = 0;
+        while (intfc->GetNextRecordInfo(type, version, length)) {
+            if (type != kRecordClones || version != kRecordVersion) {
+                continue;
+            }
+            std::uint32_t count = 0;
+            intfc->ReadRecordData(count);
+            for (std::uint32_t i = 0; i < count; ++i) {
+                RE::FormID  oldClone = 0, oldBase = 0;
+                CloneRecord rec;
+                intfc->ReadRecordData(oldClone);
+                intfc->ReadRecordData(oldBase);
+                intfc->ReadRecordData(rec.damage);
+                intfc->ReadRecordData(rec.value);
+                intfc->ReadRecordData(rec.weightDiv);
+                intfc->ReadRecordData(rec.crit);
+                intfc->ReadRecordData(rec.speed);
+                std::uint32_t len = 0;
+                intfc->ReadRecordData(len);
+                if (len > 0 && len < 256) {
+                    rec.rarity.resize(len);
+                    intfc->ReadRecordData(rec.rarity.data(), len);
+                }
+
+                RE::FormID newClone = 0, newBase = 0;
+                if (!intfc->ResolveFormID(oldClone, newClone)) {
+                    Log("  nao foi possivel resolver a copia {:08X}.", oldClone);
+                    continue;
+                }
+                if (!intfc->ResolveFormID(oldBase, newBase)) {
+                    Log("  nao foi possivel resolver a arma original {:08X}.", oldBase);
+                    continue;
+                }
+                rec.baseID = newBase;
+                g_clones[newClone] = rec;
+            }
+        }
+        Log("Cosave lido: {} copias.", g_clones.size());
+        RepopulateAll("carregamento do save");
+    }
+
+    void RevertCallback(SKSE::SerializationInterface*)
+    {
+        g_clones.clear();
+        Log("Revert: registro de copias limpo.");
+    }
+
+    // ------------------------------------------------------------------
+    // Criacao de uma copia nova para um item forjado
+    // ------------------------------------------------------------------
+    bool IsEligible(RE::TESBoundObject* obj)
+    {
+        auto* weap = obj ? obj->As<RE::TESObjectWEAP>() : nullptr;
+        if (!weap) {
+            return false;
+        }
+        if (weap->IsStaff()) {
+            return false;
+        }
+        return true;
+    }
+
+    void ProcessNewItem(RE::FormID itemID)
+    {
+        Log("ProcessNewItem {:08X}", itemID);
+
+        if (g_clones.contains(itemID)) {
+            Log("  ja e uma copia nossa, ignorado.");
+            return;
+        }
+
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        auto* base = RE::TESForm::LookupByID<RE::TESObjectWEAP>(itemID);
+        if (!player || !base || !IsEligible(base)) {
+            Log("  ignorado (nao e uma arma elegivel).");
+            return;
+        }
+
+        auto inv = player->GetInventory([base](RE::TESBoundObject& o) { return &o == base; });
+        auto it = inv.find(base);
+        if (it == inv.end() || it->second.first < 1) {
+            Log("  arma nao encontrada no inventario.");
+            return;
+        }
+
+        // 1) raridade
+        float total = 0.0f;
+        for (auto& r : g_cfg.rarities) {
+            total += std::max(0.0f, r.chance);
+        }
         std::uniform_real_distribution<float> pick(0.0f, total);
         float                                  x = pick(Rng());
-
-        const RarityDef* chosen = &g_cfg.rarities[0];
+        const RarityDef*                       chosen = &g_cfg.rarities[0];
         for (auto& r : g_cfg.rarities) {
-            const float w = std::max(0.0f, r.weight);
+            const float w = std::max(0.0f, r.chance);
             if (x < w) {
                 chosen = &r;
                 break;
@@ -190,187 +405,45 @@ namespace
             x -= w;
         }
 
-        // multiplicador em passos de 0.01 (1.01, 1.02, ... 4.99, 5.00)
-        const int lo = static_cast<int>(std::lround(chosen->minMult * 100.0f));
-        const int hi = static_cast<int>(std::lround(chosen->maxMult * 100.0f));
-        int       v = lo;
-        if (hi > lo) {
-            std::uniform_int_distribution<int> step(lo, hi);
-            v = step(Rng());
-        }
-        return { chosen->name, static_cast<float>(v) / 100.0f };
-    }
+        // 2) multiplicadores
+        CloneRecord rec;
+        rec.baseID = base->GetFormID();
+        rec.rarity = chosen->name;
+        rec.damage = RollRange(chosen->damage);
+        rec.value = RollRange(chosen->value);
+        rec.weightDiv = chosen->weightDiv;
+        rec.crit = 1.0f + RollRange(chosen->critBonus);
+        rec.speed = RollRange(chosen->speed);
+        Log("  sorteio: {} dano x{:.2f} valor x{:.2f} peso /{:.2f} crit x{:.2f} vel x{:.2f}",
+            rec.rarity, rec.damage, rec.value, rec.weightDiv, rec.crit, rec.speed);
 
-    // ------------------------------------------------------------------
-    // Filtro de itens
-    // ------------------------------------------------------------------
-    bool HasKeyword(RE::BGSKeywordForm* form, const char* editorID)
-    {
-        if (!form || !form->keywords) {
-            return false;
-        }
-        for (std::uint32_t i = 0; i < form->numKeywords; ++i) {
-            auto* kw = form->keywords[i];
-            if (kw) {
-                const char* id = kw->GetFormEditorID();
-                if (id && std::string_view(id) == editorID) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    bool IsEligible(RE::TESBoundObject* obj)
-    {
-        if (!obj) {
-            return false;
-        }
-
-        if (auto* weap = obj->As<RE::TESObjectWEAP>()) {
-            if (!g_cfg.affectWeapons) {
-                return false;
-            }
-            if (weap->IsStaff()) {
-                return false;
-            }
-            return true;
-        }
-
-        if (auto* armo = obj->As<RE::TESObjectARMO>()) {
-            if (!g_cfg.affectArmor) {
-                return false;
-            }
-            // roupas e joias nao entram
-            if (HasKeyword(armo, "ArmorClothing") || HasKeyword(armo, "ArmorJewelry")) {
-                return false;
-            }
-            return true;
-        }
-
-        return false;
-    }
-
-    // ------------------------------------------------------------------
-    // Aplicacao da raridade
-    // ------------------------------------------------------------------
-    bool IsTagged(RE::ExtraDataList* list)
-    {
-        if (!list) {
-            return false;
-        }
-        auto* tdd = list->GetByType<RE::ExtraTextDisplayData>();
-        if (!tdd) {
-            return false;
-        }
-        const char* n = tdd->displayName.c_str();
-        return n && n[0] == '[';
-    }
-
-    void Decorate(RE::ExtraDataList* list, RE::TESBoundObject* obj, const RollResult& r)
-    {
-        Log("  Decorate: etapa 1 (multiplicador)");
-        // 1) multiplicador (dano / armadura / valor)
-        auto* health = list->GetByType<RE::ExtraHealth>();
-        if (!health) {
-            health = RE::BSExtraData::Create<RE::ExtraHealth>();
-            list->Add(health);
-        }
-        health->health = r.multiplier * g_cfg.healthScale;
-
-        Log("  Decorate: etapa 2 (nome)");
-        // 2) nome com etiqueta
-        auto*       tdd = list->GetByType<RE::ExtraTextDisplayData>();
-        std::string baseName = obj->GetName();
-        if (tdd && tdd->displayName.c_str() && tdd->displayName.c_str()[0] != '\0') {
-            baseName = tdd->displayName.c_str();
-        }
-        if (!tdd) {
-            tdd = RE::BSExtraData::Create<RE::ExtraTextDisplayData>();
-            list->Add(tdd);
-        }
-        const std::string newName = std::format("[{}] {}", r.name, baseName);
-        tdd->SetName(newName.c_str());
-
-        Log("Item {:08X} ({}) -> {} x{:.2f}", obj->GetFormID(), baseName, r.name, r.multiplier);
-    }
-
-    void ProcessNewItem(RE::FormID baseID)
-    {
-        Log("ProcessNewItem {:08X}", baseID);
-
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        auto* obj = RE::TESForm::LookupByID<RE::TESBoundObject>(baseID);
-        if (!player || !IsEligible(obj)) {
-            Log("  ignorado (item nao elegivel)");
+        // 3) criar a copia
+        auto* factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::TESObjectWEAP>();
+        if (!factory) {
+            Log("  FALHA: fabrica de armas indisponivel.");
             return;
         }
-
-        auto inv = player->GetInventory([obj](RE::TESBoundObject& o) { return &o == obj; });
-        auto it = inv.find(obj);
-        if (it == inv.end()) {
-            Log("  item nao encontrado no inventario");
+        auto* clone = factory->Create();
+        if (!clone) {
+            Log("  FALHA: nao foi possivel criar a copia.");
             return;
         }
+        Log("  copia criada com FormID {:08X}", clone->GetFormID());
 
-        const int               totalCount = it->second.first;
-        RE::InventoryEntryData* entry = it->second.second.get();
-
-        int                untaggedExtraCount = 0;
-        int                extraTotal = 0;
-        RE::ExtraDataList* untaggedList = nullptr;
-        if (entry && entry->extraLists) {
-            for (auto* list : *entry->extraLists) {
-                if (!list) {
-                    continue;
-                }
-                const int c = std::max<int>(1, list->GetCount());
-                extraTotal += c;
-                if (!untaggedList && c == 1 && !IsTagged(list)) {
-                    untaggedList = list;
-                    ++untaggedExtraCount;
-                }
-            }
-        }
-        const int plainCount = totalCount - extraTotal;
-        Log("  total={} comDadosExtras={} simples={} listaSemEtiqueta={}",
-            totalCount, extraTotal, plainCount, untaggedList ? "sim" : "nao");
-
-        const RollResult r = Roll();
-        Log("  sorteio: {} x{:.2f}", r.name, r.multiplier);
-
-        if (plainCount > 0) {
-            // Caminho A: item simples. Criamos uma copia no mundo (a referencia
-            // tem seu proprio bloco de dados extras, gerenciado pelo jogo),
-            // decoramos essa copia, removemos o item simples e recolhemos a copia.
-            auto refPtr = player->PlaceObjectAtMe(obj, false);
-            RE::TESObjectREFR* ref = refPtr.get();
-            if (!ref) {
-                Log("  FALHA: nao foi possivel criar a referencia");
-                return;
-            }
-            Log("  referencia criada");
-
-            Decorate(&ref->extraList, obj, r);
-            Log("  referencia decorada");
-
-            player->RemoveItem(obj, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
-            Log("  item simples removido do inventario");
-
-            player->PickUpObject(ref, 1, false, false);
-            Log("  referencia recolhida");
-        } else if (untaggedList) {
-            // Caminho B: o item ja tem dados extras (ex: aprimoramento).
-            Log("  caminho B: alterando dados extras existentes");
-            Decorate(untaggedList, obj, r);
-            Log("  decorado");
-        } else {
-            Log("  nada a fazer");
+        if (!BuildClone(clone, base, rec)) {
+            Log("  FALHA ao preencher a copia.");
             return;
         }
+        g_clones[clone->GetFormID()] = rec;
+
+        // 4) trocar no inventario
+        player->RemoveItem(base, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+        Log("  arma original removida");
+        player->AddObjectToContainer(clone, nullptr, 1, nullptr);
+        Log("  copia adicionada ao inventario");
 
         if (g_cfg.notify) {
-            const std::string msg = std::format("{}: {} (x{:.2f})", r.name, obj->GetName(), r.multiplier);
+            const std::string msg = std::format("{}: {}", rec.rarity, base->GetName());
             RE::DebugNotification(msg.c_str());
         }
         Log("  concluido");
@@ -379,6 +452,10 @@ namespace
     // ------------------------------------------------------------------
     // Eventos do jogo
     // ------------------------------------------------------------------
+    bool g_craftingMenuOpen = false;
+    bool g_busy = false;
+    std::chrono::steady_clock::time_point g_cooldownUntil{};
+
     class MenuSink : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
     {
     public:
@@ -413,7 +490,6 @@ namespace
             if (!a_event || g_busy || std::chrono::steady_clock::now() < g_cooldownUntil) {
                 return RE::BSEventNotifyControl::kContinue;
             }
-            // item novo (veio de "lugar nenhum") entrando no inventario do jogador (0x14)
             if (a_event->newContainer != 0x14 || a_event->oldContainer != 0) {
                 return RE::BSEventNotifyControl::kContinue;
             }
@@ -423,9 +499,14 @@ namespace
 
             const RE::FormID base = a_event->baseObj;
             const int        count = std::max<int>(1, a_event->itemCount);
-            Log("Evento: item {:08X} x{} entrou no inventario (menu de forja aberto={})", base, count, g_craftingMenuOpen);
 
-            // Executa no fluxo principal do jogo, fora do evento, por seguranca.
+            // so nos interessam armas
+            auto* form = RE::TESForm::LookupByID(base);
+            if (!form || !form->As<RE::TESObjectWEAP>()) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            Log("Evento: arma {:08X} x{} entrou no inventario durante a forja", base, count);
+
             SKSE::GetTaskInterface()->AddTask([base, count]() {
                 g_busy = true;
                 for (int i = 0; i < count; ++i) {
@@ -440,25 +521,38 @@ namespace
 
     void OnMessage(SKSE::MessagingInterface::Message* msg)
     {
-        if (msg->type == SKSE::MessagingInterface::kDataLoaded) {
+        switch (msg->type) {
+        case SKSE::MessagingInterface::kDataLoaded:
             if (auto* ui = RE::UI::GetSingleton()) {
                 ui->AddEventSink<RE::MenuOpenCloseEvent>(MenuSink::Get());
             }
             if (auto* holder = RE::ScriptEventSourceHolder::GetSingleton()) {
                 holder->AddEventSink<RE::TESContainerChangedEvent>(ContainerSink::Get());
             }
-            Log("RarityForge: eventos registrados.");
+            Log("Eventos registrados.");
+            break;
+        case SKSE::MessagingInterface::kPostLoadGame:
+            RepopulateAll("apos carregar o jogo");
+            RE::DebugNotification("Overgeared v3 (prototipo) ativo");
+            break;
+        default:
+            break;
         }
     }
-
 }
 
 SKSEPluginLoad(const SKSE::LoadInterface* skse)
 {
     SKSE::Init(skse);
     SetupLog();
-    Log("RarityForge carregando...");
     LoadConfig();
+
+    if (auto* ser = SKSE::GetSerializationInterface()) {
+        ser->SetUniqueID(kUniqueID);
+        ser->SetSaveCallback(SaveCallback);
+        ser->SetLoadCallback(LoadCallback);
+        ser->SetRevertCallback(RevertCallback);
+    }
     SKSE::GetMessagingInterface()->RegisterListener(OnMessage);
     return true;
 }
