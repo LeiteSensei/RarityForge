@@ -19,6 +19,7 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <format>
 #include <fstream>
 #include <random>
@@ -294,7 +295,14 @@ namespace
         if (plainCount > 0) {
             // Caminho A: item "simples" (sem dados extras). Removemos 1 e
             // devolvemos 1 com um bloco de dados extras proprio.
-            auto* list = new RE::ExtraDataList();
+            // O construtor de ExtraDataList nao esta disponivel na biblioteca,
+            // entao pedimos memoria ao jogo e zeramos (= bloco vazio valido).
+            void* mem = RE::malloc(sizeof(RE::ExtraDataList));
+            if (!mem) {
+                return;
+            }
+            std::memset(mem, 0, sizeof(RE::ExtraDataList));
+            auto* list = static_cast<RE::ExtraDataList*>(mem);
             Decorate(list, obj, r);
             player->RemoveItem(obj, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
             player->AddObjectToContainer(obj, list, 1, nullptr);
