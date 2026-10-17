@@ -1,4 +1,4 @@
-name: Compilar RarityForge
+name: Compilar Overgeared
 
 # Roda sozinho toda vez que voce envia arquivos, e tambem pelo botao "Run workflow".
 on:
@@ -40,11 +40,11 @@ jobs:
         shell: bash
         run: |
           mkdir -p package/SKSE/Plugins
-          cp build/Release/RarityForge.dll package/SKSE/Plugins/
-          cp RarityForge.ini package/SKSE/Plugins/
+          cp build/Release/Overgeared.dll package/SKSE/Plugins/
+          cp Overgeared.ini package/SKSE/Plugins/
 
       - name: Enviar o resultado
         uses: actions/upload-artifact@v4
         with:
-          name: RarityForge
+          name: Overgeared
           path: package
