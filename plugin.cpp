@@ -22,14 +22,17 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstddef>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <random>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace
 {
@@ -210,6 +213,48 @@ namespace
     };
 
     std::unordered_map<RE::FormID, CloneRecord> g_clones;  // chave: FormID da copia
+    std::unordered_set<RE::FormID>              g_built;   // copias ja montadas nesta sessao
+
+    // O Copy() da biblioteca nao copia o modelo, o tipo de animacao etc.
+    // Por isso copiamos cada parte da arma explicitamente.
+    template <class T>
+    void CopyComp(RE::TESObjectWEAP* dst, RE::TESObjectWEAP* src)
+    {
+        RE::BaseFormComponent* d = static_cast<T*>(dst);
+        RE::BaseFormComponent* s = static_cast<T*>(src);
+        d->CopyComponent(s);
+    }
+
+    void CopyWeaponParts(RE::TESObjectWEAP* dst, RE::TESObjectWEAP* src)
+    {
+        dst->objectBounds = src->objectBounds;
+
+        // componentes (modelo, equipamento, sons, palavras-chave...)
+        CopyComp<RE::TESFullName>(dst, src);
+        CopyComp<RE::TESModelTextureSwap>(dst, src);
+        CopyComp<RE::TESIcon>(dst, src);
+        CopyComp<RE::TESEnchantableForm>(dst, src);
+        CopyComp<RE::BGSDestructibleObjectForm>(dst, src);
+        CopyComp<RE::BGSEquipType>(dst, src);
+        CopyComp<RE::BGSPreloadable>(dst, src);
+        CopyComp<RE::TESWeightForm>(dst, src);
+        CopyComp<RE::TESValueForm>(dst, src);
+        CopyComp<RE::TESAttackDamageForm>(dst, src);
+        CopyComp<RE::BGSMessageIcon>(dst, src);
+        CopyComp<RE::BGSPickupPutdownSounds>(dst, src);
+        CopyComp<RE::BGSBlockBashData>(dst, src);
+        CopyComp<RE::BGSKeywordForm>(dst, src);
+        CopyComp<RE::TESDescription>(dst, src);
+
+        // campos proprios da arma (tipo de animacao, alcance, velocidade, sons de ataque...):
+        // tudo o que vem depois do ultimo componente
+        auto*             dstTail = reinterpret_cast<std::byte*>(static_cast<RE::TESDescription*>(dst)) + sizeof(RE::TESDescription);
+        auto*             srcTail = reinterpret_cast<std::byte*>(static_cast<RE::TESDescription*>(src)) + sizeof(RE::TESDescription);
+        const std::size_t offset = static_cast<std::size_t>(dstTail - reinterpret_cast<std::byte*>(dst));
+        const std::size_t size = sizeof(RE::TESObjectWEAP) - offset;
+        std::memcpy(dstTail, srcTail, size);
+        Log("  partes copiadas: campos proprios a partir do deslocamento 0x{:X}, {} bytes", offset, size);
+    }
 
     // Preenche (ou refaz) a copia a partir da arma original + multiplicadores.
     bool BuildClone(RE::TESObjectWEAP* clone, RE::TESObjectWEAP* base, const CloneRecord& rec)
@@ -218,12 +263,7 @@ namespace
             return false;
         }
 
-        const RE::FormID idBefore = clone->GetFormID();
-        clone->Copy(base);
-        const RE::FormID idAfter = clone->GetFormID();
-        if (idBefore != idAfter) {
-            Log("  AVISO: o FormID da copia mudou durante o Copy ({:08X} -> {:08X})", idBefore, idAfter);
-        }
+        CopyWeaponParts(clone, base);
 
         auto rnd16 = [](float v) {
             return static_cast<std::uint16_t>(std::clamp<long>(std::lround(v), 0L, 65535L));
@@ -245,14 +285,16 @@ namespace
         const std::string newName = std::format("[{}] {}", rec.rarity, base->GetName());
         clone->fullName = newName.c_str();
 
-        Log("  copia {:08X} de {:08X}: nome='{}' dano {}->{} valor {}->{} peso {:.2f}->{:.2f} crit {}->{} vel {:.2f}->{:.2f} modelo='{}'",
+        Log("  copia {:08X} de {:08X}: nome='{}' dano {}->{} valor {}->{} peso {:.2f}->{:.2f} crit {}->{} vel {:.2f}->{:.2f} palavras-chave={} modelo='{}'",
             clone->GetFormID(), base->GetFormID(), newName,
             base->attackDamage, clone->attackDamage,
             base->value, clone->value,
             base->weight, clone->weight,
             base->criticalData.damage, clone->criticalData.damage,
             base->weaponData.speed, clone->weaponData.speed,
+            clone->numKeywords,
             clone->GetModel() ? clone->GetModel() : "(sem modelo)");
+        g_built.insert(clone->GetFormID());
         return true;
     }
 
@@ -260,6 +302,9 @@ namespace
     {
         Log("Refazendo copias ({}): {} registradas.", reason, g_clones.size());
         for (auto& [cloneID, rec] : g_clones) {
+            if (g_built.contains(cloneID)) {
+                continue;  // ja montada nesta sessao
+            }
             auto* clone = RE::TESForm::LookupByID<RE::TESObjectWEAP>(cloneID);
             auto* base = RE::TESForm::LookupByID<RE::TESObjectWEAP>(rec.baseID);
             if (!clone) {
@@ -309,6 +354,7 @@ namespace
     void LoadCallback(SKSE::SerializationInterface* intfc)
     {
         g_clones.clear();
+        g_built.clear();
 
         std::uint32_t type = 0, version = 0, length = 0;
         while (intfc->GetNextRecordInfo(type, version, length)) {
@@ -354,6 +400,7 @@ namespace
     void RevertCallback(SKSE::SerializationInterface*)
     {
         g_clones.clear();
+        g_built.clear();
         Log("Revert: registro de copias limpo.");
     }
 
