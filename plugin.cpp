@@ -13,13 +13,14 @@
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
-#include <spdlog/sinks/basic_file_sink.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <random>
@@ -56,8 +57,43 @@ namespace
 
     Config g_cfg;
 
+
+    // ------------------------------------------------------------------
+    // Log simples: escreve e grava no disco a cada linha
+    // ------------------------------------------------------------------
+    std::ofstream g_logFile;
+
+    void WriteLog(const std::string& s)
+    {
+        if (g_logFile.is_open()) {
+            g_logFile << s << "\n";
+            g_logFile.flush();
+        }
+    }
+
+    template <class... Args>
+    void Log(std::format_string<Args...> fmt, Args&&... args)
+    {
+        WriteLog(std::format(fmt, std::forward<Args>(args)...));
+    }
+
+    void SetupLog()
+    {
+        std::filesystem::path path;
+        if (auto folder = SKSE::log::log_directory()) {
+            path = *folder / "RarityForge.log";
+        } else {
+            path = std::filesystem::path("Data") / "SKSE" / "Plugins" / "RarityForge.log";
+        }
+        g_logFile.open(path, std::ios::out | std::ios::trunc);
+        if (g_logFile.is_open()) {
+            Log("RarityForge iniciado. Log em: {}", path.string());
+        }
+    }
+
     bool g_craftingMenuOpen = false;
     bool g_busy = false;  // evita o plugin reagir aos proprios ajustes
+    std::chrono::steady_clock::time_point g_cooldownUntil{};  // ignora eventos logo apos um ajuste
 
     std::mt19937& Rng()
     {
@@ -85,7 +121,7 @@ namespace
     {
         std::ifstream file("Data\\SKSE\\Plugins\\RarityForge.ini");
         if (!file.is_open()) {
-            spdlog::warn("RarityForge.ini nao encontrado, usando valores padrao.");
+            Log("RarityForge.ini nao encontrado, usando valores padrao.");
             return;
         }
 
@@ -119,10 +155,10 @@ namespace
                     }
                 }
             } catch (...) {
-                spdlog::warn("Valor invalido no ini: {} = {}", key, val);
+                Log("Valor invalido no ini: {} = {}", key, val);
             }
         }
-        spdlog::info("Configuracao carregada.");
+        Log("Configuracao carregada.");
     }
 
     // ------------------------------------------------------------------
@@ -233,6 +269,7 @@ namespace
 
     void Decorate(RE::ExtraDataList* list, RE::TESBoundObject* obj, const RollResult& r)
     {
+        Log("  Decorate: etapa 1 (multiplicador)");
         // 1) multiplicador (dano / armadura / valor)
         auto* health = list->GetByType<RE::ExtraHealth>();
         if (!health) {
@@ -241,6 +278,7 @@ namespace
         }
         health->health = r.multiplier * g_cfg.healthScale;
 
+        Log("  Decorate: etapa 2 (nome)");
         // 2) nome com etiqueta
         auto*       tdd = list->GetByType<RE::ExtraTextDisplayData>();
         std::string baseName = obj->GetName();
@@ -254,28 +292,33 @@ namespace
         const std::string newName = std::format("[{}] {}", r.name, baseName);
         tdd->SetName(newName.c_str());
 
-        spdlog::info("Item {:08X} ({}) -> {} x{:.2f}", obj->GetFormID(), baseName, r.name, r.multiplier);
+        Log("Item {:08X} ({}) -> {} x{:.2f}", obj->GetFormID(), baseName, r.name, r.multiplier);
     }
 
     void ProcessNewItem(RE::FormID baseID)
     {
+        Log("ProcessNewItem {:08X}", baseID);
+
         auto* player = RE::PlayerCharacter::GetSingleton();
         auto* obj = RE::TESForm::LookupByID<RE::TESBoundObject>(baseID);
         if (!player || !IsEligible(obj)) {
+            Log("  ignorado (item nao elegivel)");
             return;
         }
 
         auto inv = player->GetInventory([obj](RE::TESBoundObject& o) { return &o == obj; });
         auto it = inv.find(obj);
         if (it == inv.end()) {
+            Log("  item nao encontrado no inventario");
             return;
         }
 
-        const int                totalCount = it->second.first;
-        RE::InventoryEntryData*  entry = it->second.second.get();
+        const int               totalCount = it->second.first;
+        RE::InventoryEntryData* entry = it->second.second.get();
 
-        int                 extraTotal = 0;
-        RE::ExtraDataList*  untaggedList = nullptr;
+        int                untaggedExtraCount = 0;
+        int                extraTotal = 0;
+        RE::ExtraDataList* untaggedList = nullptr;
         if (entry && entry->extraLists) {
             for (auto* list : *entry->extraLists) {
                 if (!list) {
@@ -285,31 +328,44 @@ namespace
                 extraTotal += c;
                 if (!untaggedList && c == 1 && !IsTagged(list)) {
                     untaggedList = list;
+                    ++untaggedExtraCount;
                 }
             }
         }
         const int plainCount = totalCount - extraTotal;
+        Log("  total={} comDadosExtras={} simples={} listaSemEtiqueta={}",
+            totalCount, extraTotal, plainCount, untaggedList ? "sim" : "nao");
 
         const RollResult r = Roll();
+        Log("  sorteio: {} x{:.2f}", r.name, r.multiplier);
 
         if (plainCount > 0) {
-            // Caminho A: item "simples" (sem dados extras). Removemos 1 e
-            // devolvemos 1 com um bloco de dados extras proprio.
-            // O construtor de ExtraDataList nao esta disponivel na biblioteca,
-            // entao pedimos memoria ao jogo e zeramos (= bloco vazio valido).
-            void* mem = RE::malloc(sizeof(RE::ExtraDataList));
-            if (!mem) {
+            // Caminho A: item simples. Criamos uma copia no mundo (a referencia
+            // tem seu proprio bloco de dados extras, gerenciado pelo jogo),
+            // decoramos essa copia, removemos o item simples e recolhemos a copia.
+            auto refPtr = player->PlaceObjectAtMe(obj, false);
+            RE::TESObjectREFR* ref = refPtr.get();
+            if (!ref) {
+                Log("  FALHA: nao foi possivel criar a referencia");
                 return;
             }
-            std::memset(mem, 0, sizeof(RE::ExtraDataList));
-            auto* list = static_cast<RE::ExtraDataList*>(mem);
-            Decorate(list, obj, r);
+            Log("  referencia criada");
+
+            Decorate(&ref->extraList, obj, r);
+            Log("  referencia decorada");
+
             player->RemoveItem(obj, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
-            player->AddObjectToContainer(obj, list, 1, nullptr);
+            Log("  item simples removido do inventario");
+
+            player->PickUpObject(ref, 1, false, false);
+            Log("  referencia recolhida");
         } else if (untaggedList) {
-            // Caminho B: o item ja tem dados extras (ex: aprimoramento). Alteramos no lugar.
+            // Caminho B: o item ja tem dados extras (ex: aprimoramento).
+            Log("  caminho B: alterando dados extras existentes");
             Decorate(untaggedList, obj, r);
+            Log("  decorado");
         } else {
+            Log("  nada a fazer");
             return;
         }
 
@@ -317,6 +373,7 @@ namespace
             const std::string msg = std::format("{}: {} (x{:.2f})", r.name, obj->GetName(), r.multiplier);
             RE::DebugNotification(msg.c_str());
         }
+        Log("  concluido");
     }
 
     // ------------------------------------------------------------------
@@ -353,7 +410,7 @@ namespace
         RE::BSEventNotifyControl ProcessEvent(const RE::TESContainerChangedEvent*               a_event,
                                               RE::BSTEventSource<RE::TESContainerChangedEvent>*) override
         {
-            if (!a_event || g_busy) {
+            if (!a_event || g_busy || std::chrono::steady_clock::now() < g_cooldownUntil) {
                 return RE::BSEventNotifyControl::kContinue;
             }
             // item novo (veio de "lugar nenhum") entrando no inventario do jogador (0x14)
@@ -366,6 +423,7 @@ namespace
 
             const RE::FormID base = a_event->baseObj;
             const int        count = std::max<int>(1, a_event->itemCount);
+            Log("Evento: item {:08X} x{} entrou no inventario (menu de forja aberto={})", base, count, g_craftingMenuOpen);
 
             // Executa no fluxo principal do jogo, fora do evento, por seguranca.
             SKSE::GetTaskInterface()->AddTask([base, count]() {
@@ -374,6 +432,7 @@ namespace
                     ProcessNewItem(base);
                 }
                 g_busy = false;
+                g_cooldownUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
             });
             return RE::BSEventNotifyControl::kContinue;
         }
@@ -388,30 +447,17 @@ namespace
             if (auto* holder = RE::ScriptEventSourceHolder::GetSingleton()) {
                 holder->AddEventSink<RE::TESContainerChangedEvent>(ContainerSink::Get());
             }
-            spdlog::info("RarityForge: eventos registrados.");
+            Log("RarityForge: eventos registrados.");
         }
     }
 
-    void SetupLog()
-    {
-        auto folder = SKSE::log::log_directory();
-        if (!folder) {
-            return;
-        }
-        auto path = *folder / "RarityForge.log";
-        auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path.string(), true);
-        auto logger = std::make_shared<spdlog::logger>("RarityForge", std::move(sink));
-        spdlog::set_default_logger(std::move(logger));
-        spdlog::set_level(spdlog::level::info);
-        spdlog::flush_on(spdlog::level::info);
-    }
 }
 
 SKSEPluginLoad(const SKSE::LoadInterface* skse)
 {
     SKSE::Init(skse);
     SetupLog();
-    spdlog::info("RarityForge carregando...");
+    Log("RarityForge carregando...");
     LoadConfig();
     SKSE::GetMessagingInterface()->RegisterListener(OnMessage);
     return true;
