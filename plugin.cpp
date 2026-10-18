@@ -227,7 +227,13 @@ namespace
 
     void CopyWeaponParts(RE::TESObjectWEAP* dst, RE::TESObjectWEAP* src)
     {
-        dst->objectBounds = src->objectBounds;
+        // caixa de limites do objeto (a parte propria do TESBoundObject, logo apos o TESForm)
+        {
+            auto*             dstB = reinterpret_cast<std::byte*>(static_cast<RE::TESForm*>(dst)) + sizeof(RE::TESForm);
+            auto*             srcB = reinterpret_cast<std::byte*>(static_cast<RE::TESForm*>(src)) + sizeof(RE::TESForm);
+            const std::size_t sizeB = sizeof(RE::TESBoundObject) - sizeof(RE::TESForm);
+            std::memcpy(dstB, srcB, sizeB);
+        }
 
         // componentes (modelo, equipamento, sons, palavras-chave...)
         CopyComp<RE::TESFullName>(dst, src);
