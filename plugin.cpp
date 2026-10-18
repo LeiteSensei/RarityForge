@@ -16,11 +16,17 @@
 //
 // IMPORTANTE: codigo NAO testado. Veja o texto que acompanha.
 
+#define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
+
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cfloat>
+#include <cstdarg>
+#include <cstdio>
 #include <chrono>
 #include <cstddef>
 #include <cmath>
@@ -31,8 +37,13 @@
 #include <fstream>
 #include <random>
 #include <string>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+
+// Cabecalho do SKSE Menu Framework (baixado da pagina do mod no Nexus).
+// Precisa estar na mesma pasta que este arquivo.
+#include "SKSEMenuFramework.h"
 
 namespace
 {
@@ -111,6 +122,10 @@ namespace
 
     Config g_cfg;
 
+    int         g_forceRarity = 0;  // 0 = aleatoria; 1..5 = forca a raridade (para testes)
+    std::mutex  g_summaryMutex;
+    std::string g_lastSummary = "(nenhuma arma forjada ainda)";
+
     std::string Trim(std::string s)
     {
         const char* ws = " \t\r\n";
@@ -175,6 +190,32 @@ namespace
             }
         }
         Log("Configuracao carregada.");
+    }
+
+    bool SaveConfig()
+    {
+        std::ofstream f("Data\\SKSE\\Plugins\\Overgeared.ini", std::ios::out | std::ios::trunc);
+        if (!f.is_open()) {
+            Log("ERRO: nao foi possivel gravar o Overgeared.ini");
+            return false;
+        }
+        f << "; Overgeared - configuracao salva pelo menu do jogo\n";
+        f << "; Damage/Value/Speed = multiplicador sorteado entre Min e Max\n";
+        f << "; WeightDivisor = peso dividido por este valor (fixo)\n";
+        f << "; CritBonus = bonus somado ao multiplicador do dano critico (1 + bonus)\n\n";
+        f << std::format("OnlyWhenCrafting={}\nNotify={}\n\n", g_cfg.onlyWhenCrafting ? 1 : 0, g_cfg.notify ? 1 : 0);
+        for (int i = 0; i < 5; ++i) {
+            const auto& r = g_cfg.rarities[i];
+            const int   n = i + 1;
+            f << std::format("Name{0}={1}\nChance{0}={2:.2f}\n", n, r.name, r.chance);
+            f << std::format("DamageMin{0}={1:.2f}\nDamageMax{0}={2:.2f}\n", n, r.damage.min, r.damage.max);
+            f << std::format("ValueMin{0}={1:.2f}\nValueMax{0}={2:.2f}\n", n, r.value.min, r.value.max);
+            f << std::format("WeightDivisor{0}={1:.2f}\n", n, r.weightDiv);
+            f << std::format("SpeedMin{0}={1:.2f}\nSpeedMax{0}={2:.2f}\n", n, r.speed.min, r.speed.max);
+            f << std::format("CritBonusMin{0}={1:.2f}\nCritBonusMax{0}={2:.2f}\n\n", n, r.critBonus.min, r.critBonus.max);
+        }
+        Log("Overgeared.ini gravado pelo menu.");
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -465,6 +506,11 @@ namespace
             x -= w;
         }
 
+        if (g_forceRarity >= 1 && g_forceRarity <= 5) {
+            chosen = &g_cfg.rarities[g_forceRarity - 1];
+            Log("  raridade forcada pelo menu: {}", chosen->name);
+        }
+
         // 2) multiplicadores
         CloneRecord rec;
         rec.baseID = base->GetFormID();
@@ -495,6 +541,11 @@ namespace
             return;
         }
         g_clones[clone->GetFormID()] = rec;
+        {
+            std::lock_guard<std::mutex> lock(g_summaryMutex);
+            g_lastSummary = std::format("[{}] {} | dano x{:.2f}  valor x{:.2f}  peso /{:.2f}  critico x{:.2f}  velocidade x{:.2f}",
+                                        rec.rarity, base->GetName(), rec.damage, rec.value, rec.weightDiv, rec.crit, rec.speed);
+        }
 
         // 4) trocar no inventario
         player->RemoveItem(base, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
@@ -579,9 +630,102 @@ namespace
         }
     };
 
+    // ------------------------------------------------------------------
+    // Menu no SKSE Menu Framework
+    // ------------------------------------------------------------------
+    std::string g_menuStatus;
+
+    // dois sliders (minimo e maximo) que nunca se cruzam
+    void RangeSliders(const char* name, Range& r, float lo, float hi)
+    {
+        ImGuiMCP::PushID(name);
+        ImGuiMCP::Text("%s", name);
+        const bool a = ImGuiMCP::SliderFloat("minimo", &r.min, lo, hi, "%.2f", 0);
+        const bool b = ImGuiMCP::SliderFloat("maximo", &r.max, lo, hi, "%.2f", 0);
+        if (a && r.min > r.max) {
+            r.max = r.min;
+        }
+        if (b && r.max < r.min) {
+            r.min = r.max;
+        }
+        ImGuiMCP::PopID();
+    }
+
+    void __stdcall RenderMenu()
+    {
+        ImGuiMCP::Text("Overgeared - raridade de armas forjadas");
+        ImGuiMCP::TextWrapped("As mudancas valem para as PROXIMAS armas forjadas. Armas que ja existem nao mudam.");
+        ImGuiMCP::Separator();
+
+        ImGuiMCP::Checkbox("So afeta itens forjados", &g_cfg.onlyWhenCrafting);
+        ImGuiMCP::Checkbox("Mostrar notificacao ao forjar", &g_cfg.notify);
+
+        ImGuiMCP::Spacing();
+        ImGuiMCP::Text("Forcar raridade (para testes):");
+        ImGuiMCP::Combo("##forcar", &g_forceRarity, "Aleatoria\0Comum\0Rara\0Epica\0Lendaria\0Mitica\0");
+
+        ImGuiMCP::Spacing();
+        ImGuiMCP::Text("Ultima arma forjada:");
+        {
+            std::string copy;
+            {
+                std::lock_guard<std::mutex> lock(g_summaryMutex);
+                copy = g_lastSummary;
+            }
+            ImGuiMCP::TextWrapped("%s", copy.c_str());
+        }
+
+        ImGuiMCP::Separator();
+        if (ImGuiMCP::Button("Salvar no .ini")) {
+            g_menuStatus = SaveConfig() ? "Salvo em Data/SKSE/Plugins/Overgeared.ini" : "ERRO ao salvar (veja o log)";
+        }
+        ImGuiMCP::SameLine();
+        if (ImGuiMCP::Button("Recarregar do .ini")) {
+            LoadConfig();
+            g_menuStatus = "Recarregado do .ini";
+        }
+        ImGuiMCP::SameLine();
+        if (ImGuiMCP::Button("Valores padrao")) {
+            g_cfg = Config{};
+            g_menuStatus = "Valores padrao restaurados (ainda nao salvos)";
+        }
+        if (!g_menuStatus.empty()) {
+            ImGuiMCP::TextWrapped("%s", g_menuStatus.c_str());
+        }
+        ImGuiMCP::Separator();
+
+        for (int i = 0; i < 5; ++i) {
+            auto& r = g_cfg.rarities[i];
+            ImGuiMCP::PushID(i);
+            if (ImGuiMCP::CollapsingHeader(r.name.c_str())) {
+                ImGuiMCP::SliderFloat("Chance (peso relativo)", &r.chance, 0.0f, 100.0f, "%.1f", 0);
+                RangeSliders("Dano (multiplicador)", r.damage, 0.5f, 8.0f);
+                RangeSliders("Valor de venda (multiplicador)", r.value, 0.5f, 8.0f);
+                ImGuiMCP::SliderFloat("Peso: divisor fixo", &r.weightDiv, 0.5f, 6.0f, "%.2f", 0);
+                RangeSliders("Velocidade de ataque (multiplicador)", r.speed, 0.1f, 5.0f);
+                RangeSliders("Dano critico: bonus somado", r.critBonus, 0.0f, 6.0f);
+            }
+            ImGuiMCP::PopID();
+        }
+    }
+
+    void RegisterMenu()
+    {
+        if (!SKSEMenuFramework::IsInstalled()) {
+            Log("SKSE Menu Framework nao encontrado: o menu do Overgeared fica desativado.");
+            return;
+        }
+        SKSEMenuFramework::SetSection("Overgeared");
+        SKSEMenuFramework::AddSectionItem("Raridades", RenderMenu);
+        Log("Menu registrado no SKSE Menu Framework.");
+    }
+
     void OnMessage(SKSE::MessagingInterface::Message* msg)
     {
         switch (msg->type) {
+        case SKSE::MessagingInterface::kPostLoad:
+            RegisterMenu();
+            break;
         case SKSE::MessagingInterface::kDataLoaded:
             if (auto* ui = RE::UI::GetSingleton()) {
                 ui->AddEventSink<RE::MenuOpenCloseEvent>(MenuSink::Get());
