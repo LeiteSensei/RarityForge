@@ -12,7 +12,9 @@
 // Como o jogo nao grava sozinho os dados dessas copias, o plugin guarda uma
 // lista (num arquivo ao lado do save, o "cosave") e refaz os dados ao carregar.
 //
-// Nesta versao: so armas. Armaduras ficam sem raridade.
+// Nesta versao: armas E armaduras (joias ficam para depois).
+// Armaduras: a defesa recebe um multiplicador por raridade, limitado por
+// um bonus maximo em relacao a base e por um teto de defesa por tipo de peca.
 //
 // IMPORTANTE: codigo NAO testado. Veja o texto que acompanha.
 
@@ -38,6 +40,7 @@
 #include <random>
 #include <string>
 #include <mutex>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -105,26 +108,39 @@ namespace
         float       weightDiv;  // divisor do peso (fixo): 2.0 = metade do peso
         Range       speed;      // multiplicador de velocidade de ataque
         Range       critBonus;  // bonus somado ao multiplicador do dano critico (1 + bonus)
+        Range       armor;      // multiplicador de defesa (armaduras)
     };
 
     struct Config
     {
         std::array<RarityDef, 5> rarities{ {
-            { "Comum", 60.0f, { 1.00f, 1.24f }, { 1.00f, 1.10f }, 1.00f, { 1.00f, 1.24f }, { 0.00f, 0.50f } },
-            { "Rara", 25.0f, { 1.25f, 1.74f }, { 1.10f, 1.30f }, 1.25f, { 1.25f, 1.49f }, { 0.50f, 1.00f } },
-            { "Epica", 10.0f, { 1.75f, 2.99f }, { 1.30f, 1.60f }, 1.75f, { 1.50f, 1.74f }, { 1.00f, 1.50f } },
-            { "Lendaria", 4.0f, { 3.00f, 4.99f }, { 1.60f, 1.99f }, 2.25f, { 1.75f, 1.99f }, { 1.50f, 2.00f } },
-            { "Mitica", 1.0f, { 5.00f, 5.00f }, { 2.00f, 2.00f }, 3.00f, { 2.00f, 2.00f }, { 2.00f, 2.00f } },
+            { "Comum", 60.0f, { 1.00f, 1.24f }, { 1.00f, 1.10f }, 1.00f, { 1.00f, 1.24f }, { 0.00f, 0.50f }, { 1.00f, 1.10f } },
+            { "Rara", 25.0f, { 1.25f, 1.74f }, { 1.10f, 1.30f }, 1.25f, { 1.25f, 1.49f }, { 0.50f, 1.00f }, { 1.10f, 1.25f } },
+            { "Epica", 10.0f, { 1.75f, 2.99f }, { 1.30f, 1.60f }, 1.75f, { 1.50f, 1.74f }, { 1.00f, 1.50f }, { 1.25f, 1.45f } },
+            { "Lendaria", 4.0f, { 3.00f, 4.99f }, { 1.60f, 1.99f }, 2.25f, { 1.75f, 1.99f }, { 1.50f, 2.00f }, { 1.45f, 1.75f } },
+            { "Mitica", 1.0f, { 5.00f, 5.00f }, { 2.00f, 2.00f }, 3.00f, { 2.00f, 2.00f }, { 2.00f, 2.00f }, { 2.00f, 2.00f } },
         } };
         bool onlyWhenCrafting = true;
         bool notify = true;
+        bool affectWeapons = true;
+        bool affectArmor = true;
+
+        // Armaduras: limites de defesa
+        float armorMaxMult = 2.0f;  // bonus maximo em relacao a defesa base (0 = sem limite)
+        // teto de defesa EXIBIDA por tipo de peca (0 = sem teto). Nunca reduz uma peca abaixo da base.
+        float capBody = 80.0f;
+        float capHead = 45.0f;
+        float capHands = 45.0f;
+        float capFeet = 45.0f;
+        float capShield = 70.0f;
+        float capOther = 45.0f;
     };
 
     Config g_cfg;
 
     int         g_forceRarity = 0;  // 0 = aleatoria; 1..5 = forca a raridade (para testes)
     std::mutex  g_summaryMutex;
-    std::string g_lastSummary = "(nenhuma arma forjada ainda)";
+    std::string g_lastSummary = "(nenhum item forjado ainda)";
 
     std::string Trim(std::string s)
     {
@@ -168,6 +184,24 @@ namespace
                     g_cfg.onlyWhenCrafting = ToBool(val);
                 } else if (key == "Notify") {
                     g_cfg.notify = ToBool(val);
+                } else if (key == "AffectWeapons") {
+                    g_cfg.affectWeapons = ToBool(val);
+                } else if (key == "AffectArmor") {
+                    g_cfg.affectArmor = ToBool(val);
+                } else if (key == "ArmorMaxMultiplier") {
+                    g_cfg.armorMaxMult = std::stof(val);
+                } else if (key == "CapBody") {
+                    g_cfg.capBody = std::stof(val);
+                } else if (key == "CapHead") {
+                    g_cfg.capHead = std::stof(val);
+                } else if (key == "CapHands") {
+                    g_cfg.capHands = std::stof(val);
+                } else if (key == "CapFeet") {
+                    g_cfg.capFeet = std::stof(val);
+                } else if (key == "CapShield") {
+                    g_cfg.capShield = std::stof(val);
+                } else if (key == "CapOther") {
+                    g_cfg.capOther = std::stof(val);
                 } else {
                     for (int i = 0; i < 5; ++i) {
                         const std::string n = std::to_string(i + 1);
@@ -183,6 +217,8 @@ namespace
                         else if (key == "CritBonusMax" + n) r.critBonus.max = std::stof(val);
                         else if (key == "SpeedMin" + n) r.speed.min = std::stof(val);
                         else if (key == "SpeedMax" + n) r.speed.max = std::stof(val);
+                        else if (key == "ArmorMin" + n) r.armor.min = std::stof(val);
+                        else if (key == "ArmorMax" + n) r.armor.max = std::stof(val);
                     }
                 }
             } catch (...) {
@@ -203,7 +239,13 @@ namespace
         f << "; Damage/Value/Speed = multiplicador sorteado entre Min e Max\n";
         f << "; WeightDivisor = peso dividido por este valor (fixo)\n";
         f << "; CritBonus = bonus somado ao multiplicador do dano critico (1 + bonus)\n\n";
-        f << std::format("OnlyWhenCrafting={}\nNotify={}\n\n", g_cfg.onlyWhenCrafting ? 1 : 0, g_cfg.notify ? 1 : 0);
+        f << std::format("OnlyWhenCrafting={}\nNotify={}\n", g_cfg.onlyWhenCrafting ? 1 : 0, g_cfg.notify ? 1 : 0);
+        f << std::format("AffectWeapons={}\nAffectArmor={}\n", g_cfg.affectWeapons ? 1 : 0, g_cfg.affectArmor ? 1 : 0);
+        f << "; Armaduras: ArmorMaxMultiplier = bonus maximo de defesa vs a base (0 = sem limite)\n";
+        f << "; Cap* = teto de defesa exibida por tipo de peca (0 = sem teto)\n";
+        f << std::format("ArmorMaxMultiplier={:.2f}\n", g_cfg.armorMaxMult);
+        f << std::format("CapBody={:.0f}\nCapHead={:.0f}\nCapHands={:.0f}\nCapFeet={:.0f}\nCapShield={:.0f}\nCapOther={:.0f}\n\n",
+                         g_cfg.capBody, g_cfg.capHead, g_cfg.capHands, g_cfg.capFeet, g_cfg.capShield, g_cfg.capOther);
         for (int i = 0; i < 5; ++i) {
             const auto& r = g_cfg.rarities[i];
             const int   n = i + 1;
@@ -212,7 +254,8 @@ namespace
             f << std::format("ValueMin{0}={1:.2f}\nValueMax{0}={2:.2f}\n", n, r.value.min, r.value.max);
             f << std::format("WeightDivisor{0}={1:.2f}\n", n, r.weightDiv);
             f << std::format("SpeedMin{0}={1:.2f}\nSpeedMax{0}={2:.2f}\n", n, r.speed.min, r.speed.max);
-            f << std::format("CritBonusMin{0}={1:.2f}\nCritBonusMax{0}={2:.2f}\n\n", n, r.critBonus.min, r.critBonus.max);
+            f << std::format("CritBonusMin{0}={1:.2f}\nCritBonusMax{0}={2:.2f}\n", n, r.critBonus.min, r.critBonus.max);
+            f << std::format("ArmorMin{0}={1:.2f}\nArmorMax{0}={2:.2f}\n\n", n, r.armor.min, r.armor.max);
         }
         Log("Overgeared.ini gravado pelo menu.");
         return true;
@@ -251,6 +294,9 @@ namespace
         float       weightDiv{ 1.0f };  // peso dividido por isto
         float       crit{ 1.0f };       // multiplicador final do DANO CRITICO (1 + bonus)
         float       speed{ 1.0f };
+        bool          isArmor{ false };
+        float         armor{ 1.0f };    // multiplicador de defesa sorteado (armaduras)
+        std::uint32_t armorFinal{ 0 };  // defesa final gravada (ja com os limites aplicados)
     };
 
     std::unordered_map<RE::FormID, CloneRecord> g_clones;  // chave: FormID da copia
@@ -345,12 +391,251 @@ namespace
         return true;
     }
 
+    // ------------------------------------------------------------------
+    // Armaduras
+    // ------------------------------------------------------------------
+    constexpr float kRatingScale = 100.0f;  // o jogo guarda a defesa multiplicada por 100
+
+    // Para cada classe candidata a "parte" da armadura: se a armadura realmente a
+    // herda, copia o componente; se nao herda, ignora (sem erro de compilacao).
+    template <class T, class Derived>
+    int CopyCompIfBase(Derived* dst, Derived* src)
+    {
+        if constexpr (std::is_base_of_v<T, Derived>) {
+            RE::BaseFormComponent* d = static_cast<T*>(dst);
+            RE::BaseFormComponent* s = static_cast<T*>(src);
+            d->CopyComponent(s);
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+
+    // Onde termina (em bytes, a partir do inicio do objeto) a parte T da armadura.
+    template <class T, class Derived>
+    std::size_t SubobjectEnd(Derived* obj)
+    {
+        if constexpr (std::is_base_of_v<T, Derived>) {
+            auto* sub = static_cast<T*>(obj);
+            return static_cast<std::size_t>(reinterpret_cast<std::byte*>(sub) - reinterpret_cast<std::byte*>(obj)) + sizeof(T);
+        } else {
+            return 0;
+        }
+    }
+
+    void CopyArmorParts(RE::TESObjectARMO* dst, RE::TESObjectARMO* src)
+    {
+        // caixa de limites do objeto
+        {
+            auto*             dstB = reinterpret_cast<std::byte*>(static_cast<RE::TESForm*>(dst)) + sizeof(RE::TESForm);
+            auto*             srcB = reinterpret_cast<std::byte*>(static_cast<RE::TESForm*>(src)) + sizeof(RE::TESForm);
+            const std::size_t sizeB = sizeof(RE::TESBoundObject) - sizeof(RE::TESForm);
+            std::memcpy(dstB, srcB, sizeB);
+        }
+
+        int copied = 0;
+        copied += CopyCompIfBase<RE::TESFullName>(dst, src);
+        copied += CopyCompIfBase<RE::TESRaceForm>(dst, src);
+        copied += CopyCompIfBase<RE::TESModelTextureSwap>(dst, src);
+        copied += CopyCompIfBase<RE::TESIcon>(dst, src);
+        copied += CopyCompIfBase<RE::TESEnchantableForm>(dst, src);
+        copied += CopyCompIfBase<RE::BGSDestructibleObjectForm>(dst, src);
+        copied += CopyCompIfBase<RE::BGSPickupPutdownSounds>(dst, src);
+        copied += CopyCompIfBase<RE::TESBipedModelForm>(dst, src);
+        copied += CopyCompIfBase<RE::BGSEquipType>(dst, src);
+        copied += CopyCompIfBase<RE::BGSBipedObjectForm>(dst, src);
+        copied += CopyCompIfBase<RE::BGSBlockBashData>(dst, src);
+        copied += CopyCompIfBase<RE::BGSKeywordForm>(dst, src);
+        copied += CopyCompIfBase<RE::TESDescription>(dst, src);
+        copied += CopyCompIfBase<RE::TESWeightForm>(dst, src);
+        copied += CopyCompIfBase<RE::TESValueForm>(dst, src);
+        copied += CopyCompIfBase<RE::BGSMessageIcon>(dst, src);
+        copied += CopyCompIfBase<RE::BGSPreloadable>(dst, src);
+
+        // fim do ultimo componente = inicio dos campos proprios da armadura
+        const std::size_t end = std::max({
+            SubobjectEnd<RE::TESBoundObject>(dst),
+            SubobjectEnd<RE::TESFullName>(dst),
+            SubobjectEnd<RE::TESRaceForm>(dst),
+            SubobjectEnd<RE::TESModelTextureSwap>(dst),
+            SubobjectEnd<RE::TESIcon>(dst),
+            SubobjectEnd<RE::TESEnchantableForm>(dst),
+            SubobjectEnd<RE::BGSDestructibleObjectForm>(dst),
+            SubobjectEnd<RE::BGSPickupPutdownSounds>(dst),
+            SubobjectEnd<RE::TESBipedModelForm>(dst),
+            SubobjectEnd<RE::BGSEquipType>(dst),
+            SubobjectEnd<RE::BGSBipedObjectForm>(dst),
+            SubobjectEnd<RE::BGSBlockBashData>(dst),
+            SubobjectEnd<RE::BGSKeywordForm>(dst),
+            SubobjectEnd<RE::TESDescription>(dst),
+            SubobjectEnd<RE::TESWeightForm>(dst),
+            SubobjectEnd<RE::TESValueForm>(dst),
+            SubobjectEnd<RE::BGSMessageIcon>(dst),
+            SubobjectEnd<RE::BGSPreloadable>(dst),
+        });
+        const std::size_t total = sizeof(RE::TESObjectARMO);
+        if (end < total) {
+            std::memcpy(reinterpret_cast<std::byte*>(dst) + end, reinterpret_cast<std::byte*>(src) + end, total - end);
+        }
+        Log("  partes copiadas (armadura): {} componentes; campos proprios a partir de 0x{:X}, {} bytes (tamanho total 0x{:X})",
+            copied, end, total > end ? total - end : 0, total);
+    }
+
+    bool HasKeywordId(RE::BGSKeywordForm* form, const char* editorID)
+    {
+        if (!form || !form->keywords) {
+            return false;
+        }
+        for (std::uint32_t i = 0; i < form->numKeywords; ++i) {
+            auto* kw = form->keywords[i];
+            if (kw) {
+                const char* id = kw->GetFormEditorID();
+                if (id && std::string_view(id) == editorID) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    std::uint32_t SlotMask(RE::TESObjectARMO* a)
+    {
+        return static_cast<std::uint32_t>(a->GetSlotMask());
+    }
+
+    enum class ArmorCat
+    {
+        Body,
+        Head,
+        Hands,
+        Feet,
+        Shield,
+        Other
+    };
+
+    // slots: 30 cabeca(bit0) 31 cabelo(1) 32 corpo(2) 33 maos(3) 34 antebracos(4)
+    //        35 amuleto(5) 36 anel(6) 37 pes(7) 38 canelas(8) 39 escudo(9) 42 diadema(12)
+    ArmorCat Categorize(RE::TESObjectARMO* a)
+    {
+        const std::uint32_t m = SlotMask(a);
+        if (m & (1u << 2)) return ArmorCat::Body;
+        if (m & (1u << 9)) return ArmorCat::Shield;
+        if (m & ((1u << 3) | (1u << 4))) return ArmorCat::Hands;
+        if (m & ((1u << 7) | (1u << 8))) return ArmorCat::Feet;
+        if (m & ((1u << 0) | (1u << 1) | (1u << 11) | (1u << 12))) return ArmorCat::Head;
+        return ArmorCat::Other;
+    }
+
+    const char* CatName(ArmorCat c)
+    {
+        switch (c) {
+        case ArmorCat::Body: return "peitoral";
+        case ArmorCat::Head: return "cabeca";
+        case ArmorCat::Hands: return "maos";
+        case ArmorCat::Feet: return "pes";
+        case ArmorCat::Shield: return "escudo";
+        default: return "outro";
+        }
+    }
+
+    float CapFor(ArmorCat c)
+    {
+        switch (c) {
+        case ArmorCat::Body: return g_cfg.capBody;
+        case ArmorCat::Head: return g_cfg.capHead;
+        case ArmorCat::Hands: return g_cfg.capHands;
+        case ArmorCat::Feet: return g_cfg.capFeet;
+        case ArmorCat::Shield: return g_cfg.capShield;
+        default: return g_cfg.capOther;
+        }
+    }
+
+    bool IsEligibleArmor(RE::TESObjectARMO* a)
+    {
+        if (!a || !g_cfg.affectArmor) {
+            return false;
+        }
+        auto* kw = static_cast<RE::BGSKeywordForm*>(a);
+        if (HasKeywordId(kw, "ArmorClothing") || HasKeywordId(kw, "ArmorJewelry")) {
+            return false;
+        }
+        const std::uint32_t m = SlotMask(a);
+        const bool          jewelry = (m & ((1u << 5) | (1u << 6))) != 0;                                      // amuleto / anel
+        const bool          wornArmor = (m & ((1u << 0) | (1u << 2) | (1u << 3) | (1u << 7) | (1u << 9))) != 0;  // cabeca/corpo/maos/pes/escudo
+        if (jewelry && !wornArmor) {
+            return false;  // joias ficam para depois
+        }
+        if (a->armorRating == 0) {
+            return false;  // sem defesa, nada a melhorar
+        }
+        return true;
+    }
+
+    // defesa final: multiplicador sorteado, limitado pelo bonus maximo e pelo teto da peca.
+    // O teto nunca faz a peca ficar abaixo da defesa que ela ja tinha.
+    std::uint32_t ComputeArmorRating(RE::TESObjectARMO* base, float mult)
+    {
+        const float baseRating = static_cast<float>(base->armorRating);
+        float       r = baseRating * mult;
+        if (g_cfg.armorMaxMult > 0.0f) {
+            r = std::min(r, baseRating * std::max(1.0f, g_cfg.armorMaxMult));
+        }
+        const float cap = CapFor(Categorize(base)) * kRatingScale;
+        if (cap > 0.0f) {
+            r = std::min(r, std::max(baseRating, cap));
+        }
+        return static_cast<std::uint32_t>(std::max(0L, std::lround(r)));
+    }
+
+    bool BuildArmorClone(RE::TESObjectARMO* clone, RE::TESObjectARMO* base, CloneRecord& rec)
+    {
+        if (!clone || !base) {
+            return false;
+        }
+
+        CopyArmorParts(clone, base);
+
+        if (rec.armorFinal == 0) {
+            rec.armorFinal = ComputeArmorRating(base, rec.armor);
+        }
+        clone->armorRating = rec.armorFinal;
+        clone->value = std::max<std::int32_t>(1, static_cast<std::int32_t>(std::lround(static_cast<float>(base->value) * rec.value)));
+        clone->weight = std::max(0.0f, base->weight / std::max(0.01f, rec.weightDiv));
+
+        const std::string newName = std::format("[{}] {}", rec.rarity, base->GetName());
+        clone->fullName = newName.c_str();
+
+        Log("  armadura {:08X} de {:08X}: nome='{}' tipo={} defesa {:.1f}->{:.1f} (exibida; bruto {}->{}) valor {}->{} peso {:.2f}->{:.2f} palavras-chave={}",
+            clone->GetFormID(), base->GetFormID(), newName, CatName(Categorize(base)),
+            static_cast<float>(base->armorRating) / kRatingScale, static_cast<float>(clone->armorRating) / kRatingScale,
+            base->armorRating, clone->armorRating,
+            base->value, clone->value,
+            base->weight, clone->weight,
+            clone->numKeywords);
+        g_built.insert(clone->GetFormID());
+        return true;
+    }
+
     void RepopulateAll(const char* reason)
     {
         Log("Refazendo copias ({}): {} registradas.", reason, g_clones.size());
         for (auto& [cloneID, rec] : g_clones) {
             if (g_built.contains(cloneID)) {
                 continue;  // ja montada nesta sessao
+            }
+            if (rec.isArmor) {
+                auto* aClone = RE::TESForm::LookupByID<RE::TESObjectARMO>(cloneID);
+                auto* aBase = RE::TESForm::LookupByID<RE::TESObjectARMO>(rec.baseID);
+                if (!aClone) {
+                    Log("  armadura {:08X} nao existe mais no jogo (ignorada).", cloneID);
+                    continue;
+                }
+                if (!aBase) {
+                    Log("  armadura original {:08X} nao encontrada (mod removido?). Copia {:08X} ignorada.", rec.baseID, cloneID);
+                    continue;
+                }
+                BuildArmorClone(aClone, aBase, rec);
+                continue;
             }
             auto* clone = RE::TESForm::LookupByID<RE::TESObjectWEAP>(cloneID);
             auto* base = RE::TESForm::LookupByID<RE::TESObjectWEAP>(rec.baseID);
@@ -371,7 +656,7 @@ namespace
     // ------------------------------------------------------------------
     constexpr std::uint32_t kUniqueID = 'OVG1';
     constexpr std::uint32_t kRecordClones = 'CLON';
-    constexpr std::uint32_t kRecordVersion = 1;
+    constexpr std::uint32_t kRecordVersion = 2;
 
     void SaveCallback(SKSE::SerializationInterface* intfc)
     {
@@ -394,6 +679,10 @@ namespace
             if (len > 0) {
                 intfc->WriteRecordData(rec.rarity.data(), len);
             }
+            const std::uint8_t isArmor = rec.isArmor ? 1 : 0;
+            intfc->WriteRecordData(isArmor);
+            intfc->WriteRecordData(rec.armor);
+            intfc->WriteRecordData(rec.armorFinal);
         }
         Log("Cosave gravado: {} copias.", count);
     }
@@ -405,7 +694,7 @@ namespace
 
         std::uint32_t type = 0, version = 0, length = 0;
         while (intfc->GetNextRecordInfo(type, version, length)) {
-            if (type != kRecordClones || version != kRecordVersion) {
+            if (type != kRecordClones || (version != 1 && version != 2)) {
                 continue;
             }
             std::uint32_t count = 0;
@@ -425,6 +714,13 @@ namespace
                 if (len > 0 && len < 256) {
                     rec.rarity.resize(len);
                     intfc->ReadRecordData(rec.rarity.data(), len);
+                }
+                if (version >= 2) {
+                    std::uint8_t isArmor = 0;
+                    intfc->ReadRecordData(isArmor);
+                    intfc->ReadRecordData(rec.armor);
+                    intfc->ReadRecordData(rec.armorFinal);
+                    rec.isArmor = isArmor != 0;
                 }
 
                 RE::FormID newClone = 0, newBase = 0;
@@ -466,35 +762,13 @@ namespace
         return true;
     }
 
-    void ProcessNewItem(RE::FormID itemID)
+    const RarityDef* PickRarity()
     {
-        Log("ProcessNewItem {:08X}", itemID);
-
-        if (g_clones.contains(itemID)) {
-            Log("  ja e uma copia nossa, ignorado.");
-            return;
-        }
-
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        auto* base = RE::TESForm::LookupByID<RE::TESObjectWEAP>(itemID);
-        if (!player || !base || !IsEligible(base)) {
-            Log("  ignorado (nao e uma arma elegivel).");
-            return;
-        }
-
-        auto inv = player->GetInventory([base](RE::TESBoundObject& o) { return &o == base; });
-        auto it = inv.find(base);
-        if (it == inv.end() || it->second.first < 1) {
-            Log("  arma nao encontrada no inventario.");
-            return;
-        }
-
-        // 1) raridade
         float total = 0.0f;
         for (auto& r : g_cfg.rarities) {
             total += std::max(0.0f, r.chance);
         }
-        std::uniform_real_distribution<float> pick(0.0f, total);
+        std::uniform_real_distribution<float> pick(0.0f, std::max(total, 0.0001f));
         float                                  x = pick(Rng());
         const RarityDef*                       chosen = &g_cfg.rarities[0];
         for (auto& r : g_cfg.rarities) {
@@ -505,56 +779,113 @@ namespace
             }
             x -= w;
         }
-
         if (g_forceRarity >= 1 && g_forceRarity <= 5) {
             chosen = &g_cfg.rarities[g_forceRarity - 1];
             Log("  raridade forcada pelo menu: {}", chosen->name);
         }
+        return chosen;
+    }
 
-        // 2) multiplicadores
-        CloneRecord rec;
-        rec.baseID = base->GetFormID();
+    void ProcessNewItem(RE::FormID itemID)
+    {
+        Log("ProcessNewItem {:08X}", itemID);
+
+        if (g_clones.contains(itemID)) {
+            Log("  ja e uma copia nossa, ignorado.");
+            return;
+        }
+
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        auto* form = RE::TESForm::LookupByID(itemID);
+        auto* weap = form ? form->As<RE::TESObjectWEAP>() : nullptr;
+        auto* armo = form ? form->As<RE::TESObjectARMO>() : nullptr;
+
+        const bool okWeap = weap && g_cfg.affectWeapons && IsEligible(weap);
+        const bool okArmo = armo && IsEligibleArmor(armo);
+        if (!player || (!okWeap && !okArmo)) {
+            Log("  ignorado (nao e uma arma ou armadura elegivel).");
+            return;
+        }
+        RE::TESBoundObject* baseObj = okWeap ? static_cast<RE::TESBoundObject*>(weap) : static_cast<RE::TESBoundObject*>(armo);
+
+        auto inv = player->GetInventory([baseObj](RE::TESBoundObject& o) { return &o == baseObj; });
+        auto it = inv.find(baseObj);
+        if (it == inv.end() || it->second.first < 1) {
+            Log("  item nao encontrado no inventario.");
+            return;
+        }
+
+        // 1) raridade e 2) multiplicadores
+        const RarityDef* chosen = PickRarity();
+        CloneRecord      rec;
+        rec.baseID = baseObj->GetFormID();
         rec.rarity = chosen->name;
-        rec.damage = RollRange(chosen->damage);
+        rec.isArmor = okArmo;
         rec.value = RollRange(chosen->value);
         rec.weightDiv = chosen->weightDiv;
-        rec.crit = 1.0f + RollRange(chosen->critBonus);
-        rec.speed = RollRange(chosen->speed);
-        Log("  sorteio: {} dano x{:.2f} valor x{:.2f} peso /{:.2f} crit x{:.2f} vel x{:.2f}",
-            rec.rarity, rec.damage, rec.value, rec.weightDiv, rec.crit, rec.speed);
+        if (okWeap) {
+            rec.damage = RollRange(chosen->damage);
+            rec.crit = 1.0f + RollRange(chosen->critBonus);
+            rec.speed = RollRange(chosen->speed);
+            Log("  sorteio (arma): {} dano x{:.2f} valor x{:.2f} peso /{:.2f} crit x{:.2f} vel x{:.2f}",
+                rec.rarity, rec.damage, rec.value, rec.weightDiv, rec.crit, rec.speed);
+        } else {
+            rec.armor = RollRange(chosen->armor);
+            Log("  sorteio (armadura): {} defesa x{:.2f} valor x{:.2f} peso /{:.2f}",
+                rec.rarity, rec.armor, rec.value, rec.weightDiv);
+        }
 
         // 3) criar a copia
-        auto* factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::TESObjectWEAP>();
-        if (!factory) {
-            Log("  FALHA: fabrica de armas indisponivel.");
-            return;
-        }
-        auto* clone = factory->Create();
-        if (!clone) {
-            Log("  FALHA: nao foi possivel criar a copia.");
-            return;
-        }
-        Log("  copia criada com FormID {:08X}", clone->GetFormID());
-
-        if (!BuildClone(clone, base, rec)) {
-            Log("  FALHA ao preencher a copia.");
-            return;
+        RE::TESBoundObject* clone = nullptr;
+        if (okWeap) {
+            auto* factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::TESObjectWEAP>();
+            auto* c = factory ? factory->Create() : nullptr;
+            if (!c) {
+                Log("  FALHA: nao foi possivel criar a copia da arma.");
+                return;
+            }
+            Log("  copia criada com FormID {:08X}", c->GetFormID());
+            if (!BuildClone(c, weap, rec)) {
+                Log("  FALHA ao preencher a copia.");
+                return;
+            }
+            clone = c;
+        } else {
+            auto* factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::TESObjectARMO>();
+            auto* c = factory ? factory->Create() : nullptr;
+            if (!c) {
+                Log("  FALHA: nao foi possivel criar a copia da armadura.");
+                return;
+            }
+            Log("  copia criada com FormID {:08X}", c->GetFormID());
+            if (!BuildArmorClone(c, armo, rec)) {
+                Log("  FALHA ao preencher a copia.");
+                return;
+            }
+            clone = c;
         }
         g_clones[clone->GetFormID()] = rec;
         {
             std::lock_guard<std::mutex> lock(g_summaryMutex);
-            g_lastSummary = std::format("[{}] {} | dano x{:.2f}  valor x{:.2f}  peso /{:.2f}  critico x{:.2f}  velocidade x{:.2f}",
-                                        rec.rarity, base->GetName(), rec.damage, rec.value, rec.weightDiv, rec.crit, rec.speed);
+            if (okWeap) {
+                g_lastSummary = std::format("[{}] {} | dano x{:.2f}  valor x{:.2f}  peso /{:.2f}  critico x{:.2f}  velocidade x{:.2f}",
+                                            rec.rarity, baseObj->GetName(), rec.damage, rec.value, rec.weightDiv, rec.crit, rec.speed);
+            } else {
+                g_lastSummary = std::format("[{}] {} ({}) | defesa x{:.2f} -> {:.1f} (base {:.1f})  valor x{:.2f}  peso /{:.2f}",
+                                            rec.rarity, baseObj->GetName(), CatName(Categorize(armo)), rec.armor,
+                                            static_cast<float>(rec.armorFinal) / kRatingScale,
+                                            static_cast<float>(armo->armorRating) / kRatingScale, rec.value, rec.weightDiv);
+            }
         }
 
         // 4) trocar no inventario
-        player->RemoveItem(base, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
-        Log("  arma original removida");
+        player->RemoveItem(baseObj, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+        Log("  item original removido");
         player->AddObjectToContainer(clone, nullptr, 1, nullptr);
         Log("  copia adicionada ao inventario");
 
         if (g_cfg.notify) {
-            const std::string msg = std::format("{}: {}", rec.rarity, base->GetName());
+            const std::string msg = std::format("{}: {}", rec.rarity, baseObj->GetName());
             RE::DebugNotification(msg.c_str());
         }
         Log("  concluido");
@@ -611,12 +942,14 @@ namespace
             const RE::FormID base = a_event->baseObj;
             const int        count = std::max<int>(1, a_event->itemCount);
 
-            // so nos interessam armas
-            auto* form = RE::TESForm::LookupByID(base);
-            if (!form || !form->As<RE::TESObjectWEAP>()) {
+            // so nos interessam armas e armaduras
+            auto*      form = RE::TESForm::LookupByID(base);
+            const bool isWeapon = form && form->As<RE::TESObjectWEAP>() && g_cfg.affectWeapons;
+            const bool isArmor = form && form->As<RE::TESObjectARMO>() && g_cfg.affectArmor;
+            if (!isWeapon && !isArmor) {
                 return RE::BSEventNotifyControl::kContinue;
             }
-            Log("Evento: arma {:08X} x{} entrou no inventario durante a forja", base, count);
+            Log("Evento: {} {:08X} x{} entrou no inventario durante a forja", isArmor ? "armadura" : "arma", base, count);
 
             SKSE::GetTaskInterface()->AddTask([base, count]() {
                 g_busy = true;
@@ -659,6 +992,8 @@ namespace
 
         ImGuiMCP::Checkbox("So afeta itens forjados", &g_cfg.onlyWhenCrafting);
         ImGuiMCP::Checkbox("Mostrar notificacao ao forjar", &g_cfg.notify);
+        ImGuiMCP::Checkbox("Afetar armas", &g_cfg.affectWeapons);
+        ImGuiMCP::Checkbox("Afetar armaduras", &g_cfg.affectArmor);
 
         ImGuiMCP::Spacing();
         ImGuiMCP::Text("Forcar raridade (para testes):");
@@ -694,6 +1029,21 @@ namespace
         }
         ImGuiMCP::Separator();
 
+        if (ImGuiMCP::CollapsingHeader("Armaduras: limites de defesa")) {
+            ImGuiMCP::TextWrapped("Bonus maximo de defesa em relacao a base (0 = sem limite). Vale para todas as pecas.");
+            ImGuiMCP::SliderFloat("Bonus maximo (x a base)", &g_cfg.armorMaxMult, 0.0f, 5.0f, "%.2f", 0);
+            ImGuiMCP::Spacing();
+            ImGuiMCP::TextWrapped("Teto de defesa por tipo de peca (valor exibido no inventario; 0 = sem teto). "
+                                  "O teto nunca reduz uma peca abaixo da defesa que ela ja tinha.");
+            ImGuiMCP::SliderFloat("Teto: peitoral", &g_cfg.capBody, 0.0f, 700.0f, "%.0f", 0);
+            ImGuiMCP::SliderFloat("Teto: cabeca", &g_cfg.capHead, 0.0f, 700.0f, "%.0f", 0);
+            ImGuiMCP::SliderFloat("Teto: maos", &g_cfg.capHands, 0.0f, 700.0f, "%.0f", 0);
+            ImGuiMCP::SliderFloat("Teto: pes", &g_cfg.capFeet, 0.0f, 700.0f, "%.0f", 0);
+            ImGuiMCP::SliderFloat("Teto: escudo", &g_cfg.capShield, 0.0f, 700.0f, "%.0f", 0);
+            ImGuiMCP::SliderFloat("Teto: outras pecas", &g_cfg.capOther, 0.0f, 700.0f, "%.0f", 0);
+        }
+        ImGuiMCP::Separator();
+
         for (int i = 0; i < 5; ++i) {
             auto& r = g_cfg.rarities[i];
             ImGuiMCP::PushID(i);
@@ -704,6 +1054,7 @@ namespace
                 ImGuiMCP::SliderFloat("Peso: divisor fixo", &r.weightDiv, 0.5f, 6.0f, "%.2f", 0);
                 RangeSliders("Velocidade de ataque (multiplicador)", r.speed, 0.1f, 5.0f);
                 RangeSliders("Dano critico: bonus somado", r.critBonus, 0.0f, 6.0f);
+                RangeSliders("Defesa de armadura (multiplicador)", r.armor, 0.5f, 5.0f);
             }
             ImGuiMCP::PopID();
         }
