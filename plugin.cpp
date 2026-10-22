@@ -124,6 +124,8 @@ namespace
         bool notify = true;
         bool affectWeapons = true;
         bool affectArmor = true;
+        bool affectClothing = true;  // roupas (palavra-chave ArmorClothing)
+        bool affectJewelry = true;   // joias e acessorios (aneis, amuletos, oculos etc.)
 
         // Armaduras: limites de defesa
         float armorMaxMult = 2.0f;  // bonus maximo em relacao a defesa base (0 = sem limite)
@@ -188,6 +190,10 @@ namespace
                     g_cfg.affectWeapons = ToBool(val);
                 } else if (key == "AffectArmor") {
                     g_cfg.affectArmor = ToBool(val);
+                } else if (key == "AffectClothing") {
+                    g_cfg.affectClothing = ToBool(val);
+                } else if (key == "AffectJewelry") {
+                    g_cfg.affectJewelry = ToBool(val);
                 } else if (key == "ArmorMaxMultiplier") {
                     g_cfg.armorMaxMult = std::stof(val);
                 } else if (key == "CapBody") {
@@ -241,6 +247,7 @@ namespace
         f << "; CritBonus = bonus somado ao multiplicador do dano critico (1 + bonus)\n\n";
         f << std::format("OnlyWhenCrafting={}\nNotify={}\n", g_cfg.onlyWhenCrafting ? 1 : 0, g_cfg.notify ? 1 : 0);
         f << std::format("AffectWeapons={}\nAffectArmor={}\n", g_cfg.affectWeapons ? 1 : 0, g_cfg.affectArmor ? 1 : 0);
+        f << std::format("AffectClothing={}\nAffectJewelry={}\n", g_cfg.affectClothing ? 1 : 0, g_cfg.affectJewelry ? 1 : 0);
         f << "; Armaduras: ArmorMaxMultiplier = bonus maximo de defesa vs a base (0 = sem limite)\n";
         f << "; Cap* = teto de defesa exibida por tipo de peca (0 = sem teto)\n";
         f << std::format("ArmorMaxMultiplier={:.2f}\n", g_cfg.armorMaxMult);
@@ -555,19 +562,24 @@ namespace
         if (!a || !g_cfg.affectArmor) {
             return false;
         }
-        auto* kw = static_cast<RE::BGSKeywordForm*>(a);
-        if (HasKeywordId(kw, "ArmorClothing") || HasKeywordId(kw, "ArmorJewelry")) {
+        auto*               kw = static_cast<RE::BGSKeywordForm*>(a);
+        const std::uint32_t m = SlotMask(a);
+
+        // peca "de armadura de verdade": ocupa cabeca, corpo, maos, pes ou escudo
+        const bool wornArmor = (m & ((1u << 0) | (1u << 2) | (1u << 3) | (1u << 7) | (1u << 9))) != 0;
+        const bool jewelry = !wornArmor && (HasKeywordId(kw, "ArmorJewelry") || (m & ((1u << 5) | (1u << 6))) != 0);
+        const bool clothing = !wornArmor && !jewelry && HasKeywordId(kw, "ArmorClothing");
+
+        if (jewelry && !g_cfg.affectJewelry) {
+            Log("  armadura {:08X} ignorada: joia/acessorio desligado no menu (espacos 0x{:X})", a->GetFormID(), m);
             return false;
         }
-        const std::uint32_t m = SlotMask(a);
-        const bool          jewelry = (m & ((1u << 5) | (1u << 6))) != 0;                                      // amuleto / anel
-        const bool          wornArmor = (m & ((1u << 0) | (1u << 2) | (1u << 3) | (1u << 7) | (1u << 9))) != 0;  // cabeca/corpo/maos/pes/escudo
-        if (jewelry && !wornArmor) {
-            return false;  // joias ficam para depois
+        if (clothing && !g_cfg.affectClothing) {
+            Log("  armadura {:08X} ignorada: roupa desligada no menu (espacos 0x{:X})", a->GetFormID(), m);
+            return false;
         }
-        if (a->armorRating == 0) {
-            return false;  // sem defesa, nada a melhorar
-        }
+        // Pecas sem defesa tambem entram: nome, valor e peso recebem a raridade,
+        // so a defesa continua zero.
         return true;
     }
 
@@ -994,6 +1006,8 @@ namespace
         ImGuiMCP::Checkbox("Mostrar notificacao ao forjar", &g_cfg.notify);
         ImGuiMCP::Checkbox("Afetar armas", &g_cfg.affectWeapons);
         ImGuiMCP::Checkbox("Afetar armaduras", &g_cfg.affectArmor);
+        ImGuiMCP::Checkbox("Afetar roupas", &g_cfg.affectClothing);
+        ImGuiMCP::Checkbox("Afetar joias e acessorios", &g_cfg.affectJewelry);
 
         ImGuiMCP::Spacing();
         ImGuiMCP::Text("Forcar raridade (para testes):");
