@@ -41,6 +41,7 @@
 #include <string>
 #include <mutex>
 #include <type_traits>
+#include <vector>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -127,6 +128,17 @@ namespace
         bool affectClothing = true;  // roupas (palavra-chave ArmorClothing)
         bool affectJewelry = true;   // joias e acessorios (aneis, amuletos, oculos etc.)
 
+        // Janela de resultado depois de forjar
+        bool resultWindow = true;
+        int  resultMinRarity = 0;  // 0 = Comum ... 4 = Mitica: a janela aparece a partir desta raridade
+
+        // Receita de refino (teste): permite melhorar o item na pedra de amolar / mesa de armaduras
+        bool          refineEnabled = true;
+        int           refineMinRarity = 2;  // 0-based: 2 = Epica
+        int           refineMaxRarity = 2;
+        std::uint32_t refineItemID = 0x0005ACE4;  // Lingote de Ferro (Skyrim.esm), so para teste
+        int           refineItemCount = 1;
+
         // Armaduras: limites de defesa
         float armorMaxMult = 2.0f;  // bonus maximo em relacao a defesa base (0 = sem limite)
         // teto de defesa EXIBIDA por tipo de peca (0 = sem teto). Nunca reduz uma peca abaixo da base.
@@ -140,6 +152,7 @@ namespace
 
     Config g_cfg;
 
+    bool        g_craftingMenuOpen = false;
     int         g_forceRarity = 0;  // 0 = aleatoria; 1..5 = forca a raridade (para testes)
     std::mutex  g_summaryMutex;
     std::string g_lastSummary = "(nenhum item forjado ainda)";
@@ -190,6 +203,20 @@ namespace
                     g_cfg.affectWeapons = ToBool(val);
                 } else if (key == "AffectArmor") {
                     g_cfg.affectArmor = ToBool(val);
+                } else if (key == "ResultWindow") {
+                    g_cfg.resultWindow = ToBool(val);
+                } else if (key == "ResultMinRarity") {
+                    g_cfg.resultMinRarity = std::clamp(std::stoi(val) - 1, 0, 4);
+                } else if (key == "RefineEnabled") {
+                    g_cfg.refineEnabled = ToBool(val);
+                } else if (key == "RefineMinRarity") {
+                    g_cfg.refineMinRarity = std::clamp(std::stoi(val) - 1, 0, 4);
+                } else if (key == "RefineMaxRarity") {
+                    g_cfg.refineMaxRarity = std::clamp(std::stoi(val) - 1, 0, 4);
+                } else if (key == "RefineItemID") {
+                    g_cfg.refineItemID = static_cast<std::uint32_t>(std::stoul(val, nullptr, 0));
+                } else if (key == "RefineItemCount") {
+                    g_cfg.refineItemCount = std::max(1, std::stoi(val));
                 } else if (key == "AffectClothing") {
                     g_cfg.affectClothing = ToBool(val);
                 } else if (key == "AffectJewelry") {
@@ -248,6 +275,11 @@ namespace
         f << std::format("OnlyWhenCrafting={}\nNotify={}\n", g_cfg.onlyWhenCrafting ? 1 : 0, g_cfg.notify ? 1 : 0);
         f << std::format("AffectWeapons={}\nAffectArmor={}\n", g_cfg.affectWeapons ? 1 : 0, g_cfg.affectArmor ? 1 : 0);
         f << std::format("AffectClothing={}\nAffectJewelry={}\n", g_cfg.affectClothing ? 1 : 0, g_cfg.affectJewelry ? 1 : 0);
+        f << "; Janela de resultado: ResultMinRarity 1=Comum 2=Rara 3=Epica 4=Lendaria 5=Mitica\n";
+        f << std::format("ResultWindow={}\nResultMinRarity={}\n", g_cfg.resultWindow ? 1 : 0, g_cfg.resultMinRarity + 1);
+        f << "; Refino (teste): faixa de raridades que ganham receita, e o item exigido (FormID em hexadecimal)\n";
+        f << std::format("RefineEnabled={}\nRefineMinRarity={}\nRefineMaxRarity={}\nRefineItemID=0x{:08X}\nRefineItemCount={}\n",
+                         g_cfg.refineEnabled ? 1 : 0, g_cfg.refineMinRarity + 1, g_cfg.refineMaxRarity + 1, g_cfg.refineItemID, g_cfg.refineItemCount);
         f << "; Armaduras: ArmorMaxMultiplier = bonus maximo de defesa vs a base (0 = sem limite)\n";
         f << "; Cap* = teto de defesa exibida por tipo de peca (0 = sem teto)\n";
         f << std::format("ArmorMaxMultiplier={:.2f}\n", g_cfg.armorMaxMult);
@@ -774,6 +806,129 @@ namespace
         return true;
     }
 
+    // ------------------------------------------------------------------
+    // Janela de resultado (caixa de mensagem do jogo)
+    // ------------------------------------------------------------------
+    std::mutex               g_pendingMutex;
+    std::vector<std::string> g_pendingMessages;
+
+    void QueueResultWindow(const std::string& text)
+    {
+        std::lock_guard<std::mutex> lock(g_pendingMutex);
+        g_pendingMessages.push_back(text);
+    }
+
+    // Deve rodar no fluxo principal do jogo.
+    void FlushResultWindow()
+    {
+        std::vector<std::string> msgs;
+        {
+            std::lock_guard<std::mutex> lock(g_pendingMutex);
+            msgs.swap(g_pendingMessages);
+        }
+        if (msgs.empty()) {
+            return;
+        }
+        std::string       all;
+        const std::size_t start = msgs.size() > 3 ? msgs.size() - 3 : 0;
+        if (start > 0) {
+            all += std::format("(+{} itens anteriores)\n\n", start);
+        }
+        for (std::size_t i = start; i < msgs.size(); ++i) {
+            all += msgs[i];
+            if (i + 1 < msgs.size()) {
+                all += "\n\n----------\n\n";
+            }
+        }
+        Log("Mostrando janela de resultado ({} itens).", msgs.size());
+        RE::DebugMessageBox(all.c_str());
+    }
+
+    // ------------------------------------------------------------------
+    // Receita de refino (TESTE): cria, para cada copia, uma receita de melhoria
+    // na pedra de amolar (armas) ou na mesa de armaduras.
+    // ------------------------------------------------------------------
+    std::unordered_map<RE::FormID, RE::BGSConstructibleObject*> g_recipes;  // copia -> receita
+
+    template <class C>
+    void FillRecipe(C* cobj, RE::TESForm* created, RE::BGSKeyword* bench, RE::TESBoundObject* ingredient, int count)
+    {
+        auto** arr = static_cast<RE::ContainerObject**>(RE::malloc(sizeof(RE::ContainerObject*)));
+        auto*  entry = static_cast<RE::ContainerObject*>(RE::malloc(sizeof(RE::ContainerObject)));
+        std::memset(entry, 0, sizeof(RE::ContainerObject));
+        entry->obj = ingredient;
+        entry->count = count;
+        arr[0] = entry;
+        if constexpr (requires { cobj->requiredItems; }) {
+            cobj->requiredItems.containerObjects = arr;
+            cobj->requiredItems.numContainerObjects = 1;
+        } else {
+            cobj->containerObjects = arr;
+            cobj->numContainerObjects = 1;
+        }
+        cobj->createdItem = created;
+        cobj->benchKeyword = bench;
+        if constexpr (requires { cobj->data.numConstructed; }) {
+            cobj->data.numConstructed = 1;
+        }
+    }
+
+    void EnsureRefineRecipe(RE::TESBoundObject* clone, bool isArmor, int rarityIndex)
+    {
+        if (!clone || !g_cfg.refineEnabled) {
+            return;
+        }
+        if (rarityIndex < g_cfg.refineMinRarity || rarityIndex > g_cfg.refineMaxRarity) {
+            return;
+        }
+        if (g_recipes.contains(clone->GetFormID())) {
+            return;
+        }
+
+        auto* dh = RE::TESDataHandler::GetSingleton();
+        auto* bench = RE::TESForm::LookupByID<RE::BGSKeyword>(isArmor ? 0x000ADB78u : 0x00088108u);
+        auto* ingredient = RE::TESForm::LookupByID<RE::TESBoundObject>(g_cfg.refineItemID);
+        if (!dh || !bench || !ingredient) {
+            Log("  receita de refino NAO criada para {:08X}: dh={} bancada={} ingrediente={}",
+                clone->GetFormID(), dh != nullptr, bench != nullptr, ingredient != nullptr);
+            return;
+        }
+        auto* factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::BGSConstructibleObject>();
+        auto* cobj = factory ? factory->Create() : nullptr;
+        if (!cobj) {
+            Log("  receita de refino NAO criada: fabrica de receitas indisponivel.");
+            return;
+        }
+
+        FillRecipe(cobj, clone, bench, ingredient, g_cfg.refineItemCount);
+        dh->GetFormArray<RE::BGSConstructibleObject>().push_back(cobj);
+        g_recipes[clone->GetFormID()] = cobj;
+        const char* benchId = bench->GetFormEditorID();
+        Log("  receita de refino criada {:08X} para {:08X} (bancada {}, {}x {:08X})",
+            cobj->GetFormID(), clone->GetFormID(), benchId ? benchId : "?", g_cfg.refineItemCount, g_cfg.refineItemID);
+    }
+
+    int RarityIndexByName(const std::string& name)
+    {
+        for (int i = 0; i < 5; ++i) {
+            if (g_cfg.rarities[i].name == name) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    void EnsureAllRecipes()
+    {
+        for (auto& [cloneID, rec] : g_clones) {
+            if (!g_built.contains(cloneID)) {
+                continue;
+            }
+            auto* form = RE::TESForm::LookupByID<RE::TESBoundObject>(cloneID);
+            EnsureRefineRecipe(form, rec.isArmor, RarityIndexByName(rec.rarity));
+        }
+    }
+
     const RarityDef* PickRarity()
     {
         float total = 0.0f;
@@ -877,6 +1032,30 @@ namespace
             clone = c;
         }
         g_clones[clone->GetFormID()] = rec;
+        const int rarityIndex = static_cast<int>(chosen - &g_cfg.rarities[0]);
+        EnsureRefineRecipe(clone, okArmo, rarityIndex);
+
+        // texto da janela de resultado
+        if (g_cfg.resultWindow && rarityIndex >= g_cfg.resultMinRarity) {
+            std::string txt = std::format("[{}] {}\n\n", rec.rarity, baseObj->GetName());
+            if (okWeap) {
+                auto* cw = clone->As<RE::TESObjectWEAP>();
+                txt += std::format("Dano: {} --> {}\n", weap->attackDamage, cw->attackDamage);
+                txt += std::format("Dano critico: {} --> {}\n", weap->criticalData.damage, cw->criticalData.damage);
+                txt += std::format("Velocidade: {:.2f} --> {:.2f}\n", weap->weaponData.speed, cw->weaponData.speed);
+                txt += std::format("Peso: {:.1f} --> {:.1f}\n", weap->weight, cw->weight);
+                txt += std::format("Valor: {} --> {}", weap->value, cw->value);
+            } else {
+                auto*       ca = clone->As<RE::TESObjectARMO>();
+                const bool  limited = ca->armorRating < static_cast<std::uint32_t>(std::lround(static_cast<float>(armo->armorRating) * rec.armor));
+                txt += std::format("Defesa: {:.1f} --> {:.1f}{}\n", static_cast<float>(armo->armorRating) / kRatingScale,
+                                   static_cast<float>(ca->armorRating) / kRatingScale, limited ? " (limitada pelo teto)" : "");
+                txt += std::format("Peso: {:.1f} --> {:.1f}\n", armo->weight, ca->weight);
+                txt += std::format("Valor: {} --> {}", armo->value, ca->value);
+            }
+            QueueResultWindow(txt);
+        }
+
         {
             std::lock_guard<std::mutex> lock(g_summaryMutex);
             if (okWeap) {
@@ -900,13 +1079,15 @@ namespace
             const std::string msg = std::format("{}: {}", rec.rarity, baseObj->GetName());
             RE::DebugNotification(msg.c_str());
         }
+        if (!g_craftingMenuOpen) {
+            FlushResultWindow();
+        }
         Log("  concluido");
     }
 
     // ------------------------------------------------------------------
     // Eventos do jogo
     // ------------------------------------------------------------------
-    bool g_craftingMenuOpen = false;
     bool g_busy = false;
     std::chrono::steady_clock::time_point g_cooldownUntil{};
 
@@ -924,6 +1105,9 @@ namespace
         {
             if (a_event && a_event->menuName == RE::CraftingMenu::MENU_NAME) {
                 g_craftingMenuOpen = a_event->opening;
+                if (!a_event->opening) {
+                    SKSE::GetTaskInterface()->AddTask([]() { FlushResultWindow(); });
+                }
             }
             return RE::BSEventNotifyControl::kContinue;
         }
@@ -1008,6 +1192,10 @@ namespace
         ImGuiMCP::Checkbox("Afetar armaduras", &g_cfg.affectArmor);
         ImGuiMCP::Checkbox("Afetar roupas", &g_cfg.affectClothing);
         ImGuiMCP::Checkbox("Afetar joias e acessorios", &g_cfg.affectJewelry);
+        ImGuiMCP::Spacing();
+        ImGuiMCP::Checkbox("Mostrar janela com os atributos ao criar o item", &g_cfg.resultWindow);
+        ImGuiMCP::Text("Mostrar a janela a partir da raridade:");
+        ImGuiMCP::Combo("##janelamin", &g_cfg.resultMinRarity, "Comum\0Rara\0Epica\0Lendaria\0Mitica\0");
 
         ImGuiMCP::Spacing();
         ImGuiMCP::Text("Forcar raridade (para testes):");
@@ -1040,6 +1228,19 @@ namespace
         }
         if (!g_menuStatus.empty()) {
             ImGuiMCP::TextWrapped("%s", g_menuStatus.c_str());
+        }
+        ImGuiMCP::Separator();
+
+        if (ImGuiMCP::CollapsingHeader("Refino (teste)")) {
+            ImGuiMCP::TextWrapped("Cria uma receita para melhorar o item na pedra de amolar (armas) ou na mesa de armaduras. "
+                                  "Vale para itens criados DEPOIS de ligar e, ao carregar o jogo, para os existentes.");
+            ImGuiMCP::Checkbox("Criar receita de refino", &g_cfg.refineEnabled);
+            ImGuiMCP::Text("Da raridade:");
+            ImGuiMCP::Combo("##refmin", &g_cfg.refineMinRarity, "Comum\0Rara\0Epica\0Lendaria\0Mitica\0");
+            ImGuiMCP::Text("Ate a raridade:");
+            ImGuiMCP::Combo("##refmax", &g_cfg.refineMaxRarity, "Comum\0Rara\0Epica\0Lendaria\0Mitica\0");
+            ImGuiMCP::TextWrapped("Ingrediente exigido: %08X x%d (troque no .ini: RefineItemID e RefineItemCount)",
+                                  g_cfg.refineItemID, g_cfg.refineItemCount);
         }
         ImGuiMCP::Separator();
 
@@ -1102,6 +1303,7 @@ namespace
             break;
         case SKSE::MessagingInterface::kPostLoadGame:
             RepopulateAll("apos carregar o jogo");
+            EnsureAllRecipes();
             RE::DebugNotification("Overgeared v3 (prototipo) ativo");
             break;
         default:
