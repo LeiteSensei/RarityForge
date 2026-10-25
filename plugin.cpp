@@ -131,6 +131,12 @@ namespace
         // Janela de resultado depois de forjar
         bool resultWindow = true;
         int  resultMinRarity = 0;  // 0 = Comum ... 4 = Mitica: a janela aparece a partir desta raridade
+        int  resultMaxItems = 2;   // quantos itens cabem na mesma caixa (o resto vira "+N anteriores")
+
+        // Avaliador e arvore de habilidades
+        int  appraiseKey = 0x18;          // tecla O (codigo DirectInput): avalia o item selecionado no inventario
+        int  treeKey = 0x25;              // tecla K: abre a arvore de habilidades (0 = desligada)
+        bool appraiseNeedsPerk = true;    // exige o perk "Avaliador"
 
         // Receita de refino (teste): permite melhorar o item na pedra de amolar / mesa de armaduras
         bool          refineEnabled = true;
@@ -205,8 +211,16 @@ namespace
                     g_cfg.affectArmor = ToBool(val);
                 } else if (key == "ResultWindow") {
                     g_cfg.resultWindow = ToBool(val);
+                } else if (key == "ResultMaxItems") {
+                    g_cfg.resultMaxItems = std::clamp(std::stoi(val), 1, 5);
                 } else if (key == "ResultMinRarity") {
                     g_cfg.resultMinRarity = std::clamp(std::stoi(val) - 1, 0, 4);
+                } else if (key == "AppraiseKey") {
+                    g_cfg.appraiseKey = std::stoi(val);
+                } else if (key == "TreeKey") {
+                    g_cfg.treeKey = std::stoi(val);
+                } else if (key == "AppraiseNeedsPerk") {
+                    g_cfg.appraiseNeedsPerk = ToBool(val);
                 } else if (key == "RefineEnabled") {
                     g_cfg.refineEnabled = ToBool(val);
                 } else if (key == "RefineMinRarity") {
@@ -276,7 +290,9 @@ namespace
         f << std::format("AffectWeapons={}\nAffectArmor={}\n", g_cfg.affectWeapons ? 1 : 0, g_cfg.affectArmor ? 1 : 0);
         f << std::format("AffectClothing={}\nAffectJewelry={}\n", g_cfg.affectClothing ? 1 : 0, g_cfg.affectJewelry ? 1 : 0);
         f << "; Janela de resultado: ResultMinRarity 1=Comum 2=Rara 3=Epica 4=Lendaria 5=Mitica\n";
-        f << std::format("ResultWindow={}\nResultMinRarity={}\n", g_cfg.resultWindow ? 1 : 0, g_cfg.resultMinRarity + 1);
+        f << std::format("ResultWindow={}\nResultMinRarity={}\nResultMaxItems={}\n", g_cfg.resultWindow ? 1 : 0, g_cfg.resultMinRarity + 1, g_cfg.resultMaxItems);
+        f << "; Avaliador: AppraiseKey/TreeKey = codigos de tecla DirectInput (24 = O, 37 = K, 0 = desligada)\n";
+        f << std::format("AppraiseKey={}\nTreeKey={}\nAppraiseNeedsPerk={}\n", g_cfg.appraiseKey, g_cfg.treeKey, g_cfg.appraiseNeedsPerk ? 1 : 0);
         f << "; Refino (teste): faixa de raridades que ganham receita, e o item exigido (FormID em hexadecimal)\n";
         f << std::format("RefineEnabled={}\nRefineMinRarity={}\nRefineMaxRarity={}\nRefineItemID=0x{:08X}\nRefineItemCount={}\n",
                          g_cfg.refineEnabled ? 1 : 0, g_cfg.refineMinRarity + 1, g_cfg.refineMaxRarity + 1, g_cfg.refineItemID, g_cfg.refineItemCount);
@@ -830,14 +846,15 @@ namespace
             return;
         }
         std::string       all;
-        const std::size_t start = msgs.size() > 3 ? msgs.size() - 3 : 0;
+        const std::size_t maxItems = static_cast<std::size_t>(std::max(1, g_cfg.resultMaxItems));
+        const std::size_t start = msgs.size() > maxItems ? msgs.size() - maxItems : 0;
         if (start > 0) {
             all += std::format("(+{} itens anteriores)\n\n", start);
         }
         for (std::size_t i = start; i < msgs.size(); ++i) {
             all += msgs[i];
             if (i + 1 < msgs.size()) {
-                all += "\n\n----------\n\n";
+                all += "\n\n";
             }
         }
         Log("Mostrando janela de resultado ({} itens).", msgs.size());
@@ -953,13 +970,13 @@ namespace
         return chosen;
     }
 
-    void ProcessNewItem(RE::FormID itemID)
+    bool ProcessNewItem(RE::FormID itemID)
     {
         Log("ProcessNewItem {:08X}", itemID);
 
         if (g_clones.contains(itemID)) {
             Log("  ja e uma copia nossa, ignorado.");
-            return;
+            return false;
         }
 
         auto* player = RE::PlayerCharacter::GetSingleton();
@@ -971,7 +988,7 @@ namespace
         const bool okArmo = armo && IsEligibleArmor(armo);
         if (!player || (!okWeap && !okArmo)) {
             Log("  ignorado (nao e uma arma ou armadura elegivel).");
-            return;
+            return false;
         }
         RE::TESBoundObject* baseObj = okWeap ? static_cast<RE::TESBoundObject*>(weap) : static_cast<RE::TESBoundObject*>(armo);
 
@@ -979,7 +996,7 @@ namespace
         auto it = inv.find(baseObj);
         if (it == inv.end() || it->second.first < 1) {
             Log("  item nao encontrado no inventario.");
-            return;
+            return false;
         }
 
         // 1) raridade e 2) multiplicadores
@@ -1009,12 +1026,12 @@ namespace
             auto* c = factory ? factory->Create() : nullptr;
             if (!c) {
                 Log("  FALHA: nao foi possivel criar a copia da arma.");
-                return;
+                return false;
             }
             Log("  copia criada com FormID {:08X}", c->GetFormID());
             if (!BuildClone(c, weap, rec)) {
                 Log("  FALHA ao preencher a copia.");
-                return;
+                return false;
             }
             clone = c;
         } else {
@@ -1022,12 +1039,12 @@ namespace
             auto* c = factory ? factory->Create() : nullptr;
             if (!c) {
                 Log("  FALHA: nao foi possivel criar a copia da armadura.");
-                return;
+                return false;
             }
             Log("  copia criada com FormID {:08X}", c->GetFormID());
             if (!BuildArmorClone(c, armo, rec)) {
                 Log("  FALHA ao preencher a copia.");
-                return;
+                return false;
             }
             clone = c;
         }
@@ -1037,21 +1054,21 @@ namespace
 
         // texto da janela de resultado
         if (g_cfg.resultWindow && rarityIndex >= g_cfg.resultMinRarity) {
-            std::string txt = std::format("[{}] {}\n\n", rec.rarity, baseObj->GetName());
+            std::string txt = std::format("[{}] {}\n", rec.rarity, baseObj->GetName());
             if (okWeap) {
                 auto* cw = clone->As<RE::TESObjectWEAP>();
-                txt += std::format("Dano: {} --> {}\n", weap->attackDamage, cw->attackDamage);
-                txt += std::format("Dano critico: {} --> {}\n", weap->criticalData.damage, cw->criticalData.damage);
-                txt += std::format("Velocidade: {:.2f} --> {:.2f}\n", weap->weaponData.speed, cw->weaponData.speed);
-                txt += std::format("Peso: {:.1f} --> {:.1f}\n", weap->weight, cw->weight);
-                txt += std::format("Valor: {} --> {}", weap->value, cw->value);
+                txt += std::format("Dano: {} para {}\n", weap->attackDamage, cw->attackDamage);
+                txt += std::format("Dano critico: {} para {}\n", weap->criticalData.damage, cw->criticalData.damage);
+                txt += std::format("Velocidade: {:.2f} para {:.2f}\n", weap->weaponData.speed, cw->weaponData.speed);
+                txt += std::format("Peso: {:.1f} para {:.1f}\n", weap->weight, cw->weight);
+                txt += std::format("Valor: {} para {}", weap->value, cw->value);
             } else {
                 auto*       ca = clone->As<RE::TESObjectARMO>();
                 const bool  limited = ca->armorRating < static_cast<std::uint32_t>(std::lround(static_cast<float>(armo->armorRating) * rec.armor));
-                txt += std::format("Defesa: {:.1f} --> {:.1f}{}\n", static_cast<float>(armo->armorRating) / kRatingScale,
-                                   static_cast<float>(ca->armorRating) / kRatingScale, limited ? " (limitada pelo teto)" : "");
-                txt += std::format("Peso: {:.1f} --> {:.1f}\n", armo->weight, ca->weight);
-                txt += std::format("Valor: {} --> {}", armo->value, ca->value);
+                txt += std::format("Defesa: {:.1f} para {:.1f}{}\n", static_cast<float>(armo->armorRating) / kRatingScale,
+                                   static_cast<float>(ca->armorRating) / kRatingScale, limited ? " (limite)" : "");
+                txt += std::format("Peso: {:.1f} para {:.1f}\n", armo->weight, ca->weight);
+                txt += std::format("Valor: {} para {}", armo->value, ca->value);
             }
             QueueResultWindow(txt);
         }
@@ -1083,6 +1100,7 @@ namespace
             FlushResultWindow();
         }
         Log("  concluido");
+        return true;
     }
 
     // ------------------------------------------------------------------
@@ -1090,6 +1108,176 @@ namespace
     // ------------------------------------------------------------------
     bool g_busy = false;
     std::chrono::steady_clock::time_point g_cooldownUntil{};
+
+    // ------------------------------------------------------------------
+    // Avaliador (tecla no inventario) e arvore de habilidades
+    // ------------------------------------------------------------------
+    constexpr const char* kEspName = "Overgeared.esp";
+    constexpr RE::FormID  kShowMenuGlobalID = 0x800;
+    constexpr RE::FormID  kAppraiserPerkID = 0x801;
+
+    void Toast(const char* msg)
+    {
+        Log("Aviso ao jogador: {}", msg);
+        RE::DebugNotification(msg);
+    }
+
+    RE::BGSPerk* GetAppraiserPerk()
+    {
+        auto* dh = RE::TESDataHandler::GetSingleton();
+        return dh ? dh->LookupForm<RE::BGSPerk>(kAppraiserPerkID, kEspName) : nullptr;
+    }
+
+    bool HasAppraiserPerk()
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        auto* perk = GetAppraiserPerk();
+        return player && perk && player->HasPerk(perk);
+    }
+
+    void OpenSkillTree()
+    {
+        auto* dh = RE::TESDataHandler::GetSingleton();
+        auto* g = dh ? dh->LookupForm<RE::TESGlobal>(kShowMenuGlobalID, kEspName) : nullptr;
+        if (!g) {
+            Toast("Overgeared: o plugin da arvore (Overgeared.esp) nao esta ativo.");
+            return;
+        }
+        g->value = 1.0f;
+        Log("Arvore de habilidades: variavel de abrir o menu ligada.");
+    }
+
+    // quantas unidades "simples" (sem dados extras: encantamento do jogador, aprimoramento, equipado...)
+    int PlainCount(RE::PlayerCharacter* player, RE::TESBoundObject* obj)
+    {
+        auto inv = player->GetInventory([obj](RE::TESBoundObject& o) { return &o == obj; });
+        auto it = inv.find(obj);
+        if (it == inv.end()) {
+            return 0;
+        }
+        const int               total = it->second.first;
+        int                     extra = 0;
+        RE::InventoryEntryData* entry = it->second.second.get();
+        if (entry && entry->extraLists) {
+            for (auto* list : *entry->extraLists) {
+                if (list) {
+                    extra += std::max<int>(1, list->GetCount());
+                }
+            }
+        }
+        return total - extra;
+    }
+
+    // FormID do item selecionado no inventario (le a lista da interface; funciona com SkyUI)
+    RE::FormID SelectedInventoryFormID()
+    {
+        auto* ui = RE::UI::GetSingleton();
+        if (!ui || !ui->IsMenuOpen(RE::InventoryMenu::MENU_NAME)) {
+            return 0;
+        }
+        auto movie = ui->GetMovieView(RE::InventoryMenu::MENU_NAME);
+        if (!movie) {
+            Log("Avaliador: interface do inventario indisponivel.");
+            return 0;
+        }
+        RE::GFxValue entry;
+        if (!movie->GetVariable(&entry, "_root.Menu_mc.inventoryLists.itemList.selectedEntry") || !entry.IsObject()) {
+            Log("Avaliador: nao encontrei o item selecionado na lista do inventario.");
+            return 0;
+        }
+        RE::GFxValue fid;
+        if (!entry.GetMember("formId", &fid) || !fid.IsNumber()) {
+            Log("Avaliador: o item selecionado nao informa o formId.");
+            return 0;
+        }
+        const auto n = static_cast<std::int64_t>(fid.GetNumber());
+        return static_cast<RE::FormID>(static_cast<std::uint32_t>(n));
+    }
+
+    void AppraiseSelected()
+    {
+        Log("Avaliador: tecla pressionada no inventario.");
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return;
+        }
+        if (g_cfg.appraiseNeedsPerk && !HasAppraiserPerk()) {
+            Toast("Voce precisa do perk Avaliador para avaliar itens.");
+            return;
+        }
+        const RE::FormID id = SelectedInventoryFormID();
+        if (id == 0) {
+            Toast("Nao consegui ler o item selecionado.");
+            return;
+        }
+        if (g_clones.contains(id)) {
+            Toast("Este item ja tem raridade.");
+            return;
+        }
+        auto* form = RE::TESForm::LookupByID(id);
+        auto* obj = form ? form->As<RE::TESBoundObject>() : nullptr;
+        const bool isWeapon = obj && obj->As<RE::TESObjectWEAP>();
+        const bool isArmor = obj && obj->As<RE::TESObjectARMO>();
+        if (!isWeapon && !isArmor) {
+            Toast("So armas e armaduras podem ser avaliadas.");
+            return;
+        }
+        if (PlainCount(player, obj) < 1) {
+            Toast("Desequipe o item. Itens equipados, encantados por voce ou aprimorados nao podem ser avaliados.");
+            return;
+        }
+
+        g_busy = true;
+        const bool ok = ProcessNewItem(id);
+        g_busy = false;
+        g_cooldownUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+
+        if (!ok) {
+            Toast("Este item nao pode receber raridade (veja as opcoes no menu).");
+            return;
+        }
+        if (auto* q = RE::UIMessageQueue::GetSingleton()) {
+            q->AddMessage(RE::InventoryMenu::MENU_NAME, RE::UI_MESSAGE_TYPE::kUpdate, nullptr);
+        }
+        FlushResultWindow();
+    }
+
+    class InputSink : public RE::BSTEventSink<RE::InputEvent*>
+    {
+    public:
+        static InputSink* Get()
+        {
+            static InputSink s;
+            return &s;
+        }
+
+        RE::BSEventNotifyControl ProcessEvent(RE::InputEvent* const* a_event, RE::BSTEventSource<RE::InputEvent*>*) override
+        {
+            if (!a_event || !*a_event) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            for (auto* e = *a_event; e; e = e->next) {
+                if (e->eventType != RE::INPUT_EVENT_TYPE::kButton) {
+                    continue;
+                }
+                auto* b = static_cast<RE::ButtonEvent*>(e);
+                if (!b->IsDown() || b->GetDevice() != RE::INPUT_DEVICE::kKeyboard) {
+                    continue;
+                }
+                const int code = static_cast<int>(b->GetIDCode());
+                auto*     ui = RE::UI::GetSingleton();
+                if (!ui) {
+                    continue;
+                }
+                if (code == g_cfg.appraiseKey && g_cfg.appraiseKey != 0 && ui->IsMenuOpen(RE::InventoryMenu::MENU_NAME)) {
+                    SKSE::GetTaskInterface()->AddTask([]() { AppraiseSelected(); });
+                } else if (code == g_cfg.treeKey && g_cfg.treeKey != 0 && !ui->GameIsPaused()) {
+                    SKSE::GetTaskInterface()->AddTask([]() { OpenSkillTree(); });
+                }
+            }
+            return RE::BSEventNotifyControl::kContinue;
+        }
+    };
 
     class MenuSink : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
     {
@@ -1196,6 +1384,8 @@ namespace
         ImGuiMCP::Checkbox("Mostrar janela com os atributos ao criar o item", &g_cfg.resultWindow);
         ImGuiMCP::Text("Mostrar a janela a partir da raridade:");
         ImGuiMCP::Combo("##janelamin", &g_cfg.resultMinRarity, "Comum\0Rara\0Epica\0Lendaria\0Mitica\0");
+        ImGuiMCP::SliderInt("Itens por janela", &g_cfg.resultMaxItems, 1, 5, "%d", 0);
+        ImGuiMCP::TextWrapped("Os numeros da janela sao os valores BASE do item. No inventario o jogo soma o bonus de habilidades e perks.");
 
         ImGuiMCP::Spacing();
         ImGuiMCP::Text("Forcar raridade (para testes):");
@@ -1228,6 +1418,20 @@ namespace
         }
         if (!g_menuStatus.empty()) {
             ImGuiMCP::TextWrapped("%s", g_menuStatus.c_str());
+        }
+        ImGuiMCP::Separator();
+
+        if (ImGuiMCP::CollapsingHeader("Avaliador e arvore de habilidades")) {
+            ImGuiMCP::TextWrapped("Com o inventario aberto, selecione uma arma ou armadura e aperte a tecla de avaliar "
+                                  "(padrao O; codigo %d no .ini, chave AppraiseKey). Digitar 'o' na busca do inventario tambem aciona.",
+                                  g_cfg.appraiseKey);
+            ImGuiMCP::Checkbox("Exigir o perk Avaliador", &g_cfg.appraiseNeedsPerk);
+            ImGuiMCP::Text("Perk Avaliador: %s", HasAppraiserPerk() ? "comprado" : "nao comprado (ou Overgeared.esp inativo)");
+            if (ImGuiMCP::Button("Abrir arvore de habilidades")) {
+                OpenSkillTree();
+                g_menuStatus = "Arvore pedida. Feche este menu para ve-la.";
+            }
+            ImGuiMCP::TextWrapped("Tecla para abrir a arvore: codigo %d (TreeKey no .ini; 0 desliga).", g_cfg.treeKey);
         }
         ImGuiMCP::Separator();
 
@@ -1298,6 +1502,9 @@ namespace
             }
             if (auto* holder = RE::ScriptEventSourceHolder::GetSingleton()) {
                 holder->AddEventSink<RE::TESContainerChangedEvent>(ContainerSink::Get());
+            }
+            if (auto* input = RE::BSInputDeviceManager::GetSingleton()) {
+                input->AddEventSink(InputSink::Get());
             }
             Log("Eventos registrados.");
             break;
