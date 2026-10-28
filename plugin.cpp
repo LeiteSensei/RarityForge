@@ -133,10 +133,9 @@ namespace
         int  resultMinRarity = 0;  // 0 = Comum ... 4 = Mitica: a janela aparece a partir desta raridade
         int  resultMaxItems = 2;   // quantos itens cabem na mesma caixa (o resto vira "+N anteriores")
 
-        // Avaliador e arvore de habilidades
-        int  appraiseKey = 0x18;          // tecla O (codigo DirectInput): avalia o item selecionado no inventario
-        int  treeKey = 0x25;              // tecla K: abre a arvore de habilidades (0 = desligada)
-        bool appraiseNeedsPerk = true;    // exige o perk "Avaliador"
+        // Avaliador: tecla no inventario que sorteia a raridade de um item que voce ja tem
+        bool appraiseEnabled = true;
+        int  appraiseKey = 0x18;  // tecla O (codigo DirectInput)
 
         // Receita de refino (teste): permite melhorar o item na pedra de amolar / mesa de armaduras
         bool          refineEnabled = true;
@@ -215,12 +214,10 @@ namespace
                     g_cfg.resultMaxItems = std::clamp(std::stoi(val), 1, 5);
                 } else if (key == "ResultMinRarity") {
                     g_cfg.resultMinRarity = std::clamp(std::stoi(val) - 1, 0, 4);
+                } else if (key == "AppraiseEnabled") {
+                    g_cfg.appraiseEnabled = ToBool(val);
                 } else if (key == "AppraiseKey") {
                     g_cfg.appraiseKey = std::stoi(val);
-                } else if (key == "TreeKey") {
-                    g_cfg.treeKey = std::stoi(val);
-                } else if (key == "AppraiseNeedsPerk") {
-                    g_cfg.appraiseNeedsPerk = ToBool(val);
                 } else if (key == "RefineEnabled") {
                     g_cfg.refineEnabled = ToBool(val);
                 } else if (key == "RefineMinRarity") {
@@ -291,8 +288,8 @@ namespace
         f << std::format("AffectClothing={}\nAffectJewelry={}\n", g_cfg.affectClothing ? 1 : 0, g_cfg.affectJewelry ? 1 : 0);
         f << "; Janela de resultado: ResultMinRarity 1=Comum 2=Rara 3=Epica 4=Lendaria 5=Mitica\n";
         f << std::format("ResultWindow={}\nResultMinRarity={}\nResultMaxItems={}\n", g_cfg.resultWindow ? 1 : 0, g_cfg.resultMinRarity + 1, g_cfg.resultMaxItems);
-        f << "; Avaliador: AppraiseKey/TreeKey = codigos de tecla DirectInput (24 = O, 37 = K, 0 = desligada)\n";
-        f << std::format("AppraiseKey={}\nTreeKey={}\nAppraiseNeedsPerk={}\n", g_cfg.appraiseKey, g_cfg.treeKey, g_cfg.appraiseNeedsPerk ? 1 : 0);
+        f << "; Avaliador: AppraiseKey = codigo de tecla DirectInput (24 = O, 25 = P, 0 = desligada)\n";
+        f << std::format("AppraiseEnabled={}\nAppraiseKey={}\n", g_cfg.appraiseEnabled ? 1 : 0, g_cfg.appraiseKey);
         f << "; Refino (teste): faixa de raridades que ganham receita, e o item exigido (FormID em hexadecimal)\n";
         f << std::format("RefineEnabled={}\nRefineMinRarity={}\nRefineMaxRarity={}\nRefineItemID=0x{:08X}\nRefineItemCount={}\n",
                          g_cfg.refineEnabled ? 1 : 0, g_cfg.refineMinRarity + 1, g_cfg.refineMaxRarity + 1, g_cfg.refineItemID, g_cfg.refineItemCount);
@@ -1110,41 +1107,17 @@ namespace
     std::chrono::steady_clock::time_point g_cooldownUntil{};
 
     // ------------------------------------------------------------------
-    // Avaliador (tecla no inventario) e arvore de habilidades
+    // Avaliador: sorteia a raridade de um item que o jogador ja tem.
+    // Fluxo: tecla no inventario -> o inventario e fechado -> o item e trocado -> janela de resultado.
+    // (A lista do inventario nao se atualiza com o menu aberto, por isso a troca so acontece depois de fechar.)
     // ------------------------------------------------------------------
-    constexpr const char* kEspName = "Overgeared.esp";
-    constexpr RE::FormID  kShowMenuGlobalID = 0x800;
-    constexpr RE::FormID  kAppraiserPerkID = 0x801;
+    RE::FormID                            g_pendingAppraisal = 0;
+    std::chrono::steady_clock::time_point g_pendingSince{};
 
     void Toast(const char* msg)
     {
         Log("Aviso ao jogador: {}", msg);
         RE::DebugNotification(msg);
-    }
-
-    RE::BGSPerk* GetAppraiserPerk()
-    {
-        auto* dh = RE::TESDataHandler::GetSingleton();
-        return dh ? dh->LookupForm<RE::BGSPerk>(kAppraiserPerkID, kEspName) : nullptr;
-    }
-
-    bool HasAppraiserPerk()
-    {
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        auto* perk = GetAppraiserPerk();
-        return player && perk && player->HasPerk(perk);
-    }
-
-    void OpenSkillTree()
-    {
-        auto* dh = RE::TESDataHandler::GetSingleton();
-        auto* g = dh ? dh->LookupForm<RE::TESGlobal>(kShowMenuGlobalID, kEspName) : nullptr;
-        if (!g) {
-            Toast("Overgeared: o plugin da arvore (Overgeared.esp) nao esta ativo.");
-            return;
-        }
-        g->value = 1.0f;
-        Log("Arvore de habilidades: variavel de abrir o menu ligada.");
     }
 
     // quantas unidades "simples" (sem dados extras: encantamento do jogador, aprimoramento, equipado...)
@@ -1194,15 +1167,12 @@ namespace
         return static_cast<RE::FormID>(static_cast<std::uint32_t>(n));
     }
 
-    void AppraiseSelected()
+    // 1) tecla apertada com o inventario aberto: valida e pede para fechar o inventario
+    void RequestAppraisal()
     {
         Log("Avaliador: tecla pressionada no inventario.");
         auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!player) {
-            return;
-        }
-        if (g_cfg.appraiseNeedsPerk && !HasAppraiserPerk()) {
-            Toast("Voce precisa do perk Avaliador para avaliar itens.");
+        if (!player || g_pendingAppraisal != 0) {
             return;
         }
         const RE::FormID id = SelectedInventoryFormID();
@@ -1227,19 +1197,25 @@ namespace
             return;
         }
 
+        g_pendingAppraisal = id;
+        g_pendingSince = std::chrono::steady_clock::now();
+        Log("Avaliador: item {:08X} aceito; fechando o inventario para trocar o item.", id);
+        if (auto* q = RE::UIMessageQueue::GetSingleton()) {
+            q->AddMessage(RE::InventoryMenu::MENU_NAME, RE::UI_MESSAGE_TYPE::kHide, nullptr);
+        }
+    }
+
+    // 2) o inventario fechou: troca o item e mostra a janela de resultado
+    void RunAppraisal(RE::FormID id)
+    {
+        Log("Avaliador: inventario fechado, avaliando {:08X}.", id);
         g_busy = true;
         const bool ok = ProcessNewItem(id);
         g_busy = false;
         g_cooldownUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
-
         if (!ok) {
             Toast("Este item nao pode receber raridade (veja as opcoes no menu).");
-            return;
         }
-        if (auto* q = RE::UIMessageQueue::GetSingleton()) {
-            q->AddMessage(RE::InventoryMenu::MENU_NAME, RE::UI_MESSAGE_TYPE::kUpdate, nullptr);
-        }
-        FlushResultWindow();
     }
 
     class InputSink : public RE::BSTEventSink<RE::InputEvent*>
@@ -1253,7 +1229,7 @@ namespace
 
         RE::BSEventNotifyControl ProcessEvent(RE::InputEvent* const* a_event, RE::BSTEventSource<RE::InputEvent*>*) override
         {
-            if (!a_event || !*a_event) {
+            if (!a_event || !*a_event || !g_cfg.appraiseEnabled || g_cfg.appraiseKey == 0) {
                 return RE::BSEventNotifyControl::kContinue;
             }
             for (auto* e = *a_event; e; e = e->next) {
@@ -1264,15 +1240,12 @@ namespace
                 if (!b->IsDown() || b->GetDevice() != RE::INPUT_DEVICE::kKeyboard) {
                     continue;
                 }
-                const int code = static_cast<int>(b->GetIDCode());
-                auto*     ui = RE::UI::GetSingleton();
-                if (!ui) {
+                if (static_cast<int>(b->GetIDCode()) != g_cfg.appraiseKey) {
                     continue;
                 }
-                if (code == g_cfg.appraiseKey && g_cfg.appraiseKey != 0 && ui->IsMenuOpen(RE::InventoryMenu::MENU_NAME)) {
-                    SKSE::GetTaskInterface()->AddTask([]() { AppraiseSelected(); });
-                } else if (code == g_cfg.treeKey && g_cfg.treeKey != 0 && !ui->GameIsPaused()) {
-                    SKSE::GetTaskInterface()->AddTask([]() { OpenSkillTree(); });
+                auto* ui = RE::UI::GetSingleton();
+                if (ui && ui->IsMenuOpen(RE::InventoryMenu::MENU_NAME)) {
+                    SKSE::GetTaskInterface()->AddTask([]() { RequestAppraisal(); });
                 }
             }
             return RE::BSEventNotifyControl::kContinue;
@@ -1295,6 +1268,16 @@ namespace
                 g_craftingMenuOpen = a_event->opening;
                 if (!a_event->opening) {
                     SKSE::GetTaskInterface()->AddTask([]() { FlushResultWindow(); });
+                }
+            }
+            if (a_event && !a_event->opening && a_event->menuName == RE::InventoryMenu::MENU_NAME && g_pendingAppraisal != 0) {
+                const RE::FormID id = g_pendingAppraisal;
+                g_pendingAppraisal = 0;
+                const auto waited = std::chrono::steady_clock::now() - g_pendingSince;
+                if (waited < std::chrono::seconds(5)) {
+                    SKSE::GetTaskInterface()->AddTask([id]() { RunAppraisal(id); });
+                } else {
+                    Log("Avaliador: pedido expirado, ignorado.");
                 }
             }
             return RE::BSEventNotifyControl::kContinue;
@@ -1421,17 +1404,13 @@ namespace
         }
         ImGuiMCP::Separator();
 
-        if (ImGuiMCP::CollapsingHeader("Avaliador e arvore de habilidades")) {
-            ImGuiMCP::TextWrapped("Com o inventario aberto, selecione uma arma ou armadura e aperte a tecla de avaliar "
-                                  "(padrao O; codigo %d no .ini, chave AppraiseKey). Digitar 'o' na busca do inventario tambem aciona.",
-                                  g_cfg.appraiseKey);
-            ImGuiMCP::Checkbox("Exigir o perk Avaliador", &g_cfg.appraiseNeedsPerk);
-            ImGuiMCP::Text("Perk Avaliador: %s", HasAppraiserPerk() ? "comprado" : "nao comprado (ou Overgeared.esp inativo)");
-            if (ImGuiMCP::Button("Abrir arvore de habilidades")) {
-                OpenSkillTree();
-                g_menuStatus = "Arvore pedida. Feche este menu para ve-la.";
-            }
-            ImGuiMCP::TextWrapped("Tecla para abrir a arvore: codigo %d (TreeKey no .ini; 0 desliga).", g_cfg.treeKey);
+        if (ImGuiMCP::CollapsingHeader("Avaliador")) {
+            ImGuiMCP::TextWrapped("Com o inventario aberto, selecione uma arma ou armadura que voce ja tem e aperte a tecla de avaliar. "
+                                  "O inventario fecha, o item e trocado por uma versao com raridade, e a janela de resultado aparece.");
+            ImGuiMCP::Checkbox("Ativar o avaliador", &g_cfg.appraiseEnabled);
+            ImGuiMCP::TextWrapped("Tecla: codigo %d (AppraiseKey no .ini; 24 = O, 25 = P, 0 desliga). "
+                                  "Digitar essa letra na busca do inventario tambem aciona.", g_cfg.appraiseKey);
+            ImGuiMCP::TextWrapped("Nao avalia: itens que ja tem raridade, equipados, encantados por voce ou aprimorados.");
         }
         ImGuiMCP::Separator();
 
