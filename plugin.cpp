@@ -135,6 +135,7 @@ namespace
 
         // Avaliador: tecla no inventario que sorteia a raridade de um item que voce ja tem
         bool appraiseEnabled = true;
+        bool appraiseWindow = true;  // janela de resultado ao avaliar (sempre, de qualquer raridade)
         int  appraiseKey = 0x18;  // tecla O (codigo DirectInput)
 
         // Receita de refino (teste): permite melhorar o item na pedra de amolar / mesa de armaduras
@@ -214,6 +215,8 @@ namespace
                     g_cfg.resultMaxItems = std::clamp(std::stoi(val), 1, 5);
                 } else if (key == "ResultMinRarity") {
                     g_cfg.resultMinRarity = std::clamp(std::stoi(val) - 1, 0, 4);
+                } else if (key == "AppraiseWindow") {
+                    g_cfg.appraiseWindow = ToBool(val);
                 } else if (key == "AppraiseEnabled") {
                     g_cfg.appraiseEnabled = ToBool(val);
                 } else if (key == "AppraiseKey") {
@@ -289,7 +292,7 @@ namespace
         f << "; Janela de resultado: ResultMinRarity 1=Comum 2=Rara 3=Epica 4=Lendaria 5=Mitica\n";
         f << std::format("ResultWindow={}\nResultMinRarity={}\nResultMaxItems={}\n", g_cfg.resultWindow ? 1 : 0, g_cfg.resultMinRarity + 1, g_cfg.resultMaxItems);
         f << "; Avaliador: AppraiseKey = codigo de tecla DirectInput (24 = O, 25 = P, 0 = desligada)\n";
-        f << std::format("AppraiseEnabled={}\nAppraiseKey={}\n", g_cfg.appraiseEnabled ? 1 : 0, g_cfg.appraiseKey);
+        f << std::format("AppraiseEnabled={}\nAppraiseWindow={}\nAppraiseKey={}\n", g_cfg.appraiseEnabled ? 1 : 0, g_cfg.appraiseWindow ? 1 : 0, g_cfg.appraiseKey);
         f << "; Refino (teste): faixa de raridades que ganham receita, e o item exigido (FormID em hexadecimal)\n";
         f << std::format("RefineEnabled={}\nRefineMinRarity={}\nRefineMaxRarity={}\nRefineItemID=0x{:08X}\nRefineItemCount={}\n",
                          g_cfg.refineEnabled ? 1 : 0, g_cfg.refineMinRarity + 1, g_cfg.refineMaxRarity + 1, g_cfg.refineItemID, g_cfg.refineItemCount);
@@ -943,6 +946,67 @@ namespace
         }
     }
 
+    // ------------------------------------------------------------------
+    // Dados extras do item no inventario
+    // ------------------------------------------------------------------
+    // Dados que a copia NAO consegue carregar: equipado, aprimorado, encantamento feito pelo jogador,
+    // nome personalizado, veneno e dono (item roubado). Qualquer outro dado extra (carga atual do
+    // encantamento, tecla de atalho, lista vazia...) pode ser perdido sem problema.
+    const char* BlockingExtra(RE::ExtraDataList* list)
+    {
+        if (!list) {
+            return nullptr;
+        }
+        using T = RE::ExtraDataType;
+        if (list->HasType(T::kWorn) || list->HasType(T::kWornLeft)) return "equipado";
+        if (list->HasType(T::kHealth)) return "aprimorado";
+        if (list->HasType(T::kEnchantment)) return "encantamento feito pelo jogador";
+        if (list->HasType(T::kTextDisplayData)) return "nome personalizado";
+        if (list->HasType(T::kPoison)) return "envenenado";
+        if (list->HasType(T::kOwnership)) return "item com dono (roubado)";
+        return nullptr;
+    }
+
+    // Procura uma unidade do item que possa ser trocada. outList fica nulo para uma unidade simples,
+    // ou aponta para a lista de dados extras inofensiva da unidade escolhida.
+    bool FindRemovable(RE::PlayerCharacter* player, RE::TESBoundObject* obj, RE::ExtraDataList*& outList, std::string* whyNot = nullptr)
+    {
+        outList = nullptr;
+        auto inv = player->GetInventory([obj](RE::TESBoundObject& o) { return &o == obj; });
+        auto it = inv.find(obj);
+        if (it == inv.end() || it->second.first < 1) {
+            if (whyNot) *whyNot = "item nao encontrado no inventario";
+            return false;
+        }
+        const int               total = it->second.first;
+        int                     extraTotal = 0;
+        RE::ExtraDataList*      harmless = nullptr;
+        const char*             blockedBy = nullptr;
+        RE::InventoryEntryData* entry = it->second.second.get();
+        if (entry && entry->extraLists) {
+            for (auto* list : *entry->extraLists) {
+                if (!list) {
+                    continue;
+                }
+                extraTotal += std::max<int>(1, list->GetCount());
+                if (const char* why = BlockingExtra(list)) {
+                    blockedBy = why;
+                } else if (!harmless) {
+                    harmless = list;
+                }
+            }
+        }
+        if (harmless) {
+            outList = harmless;
+            return true;
+        }
+        if (total - extraTotal > 0) {
+            return true;  // unidade simples
+        }
+        if (whyNot) *whyNot = blockedBy ? blockedBy : "sem unidade disponivel";
+        return false;
+    }
+
     const RarityDef* PickRarity()
     {
         float total = 0.0f;
@@ -967,7 +1031,7 @@ namespace
         return chosen;
     }
 
-    bool ProcessNewItem(RE::FormID itemID)
+    bool ProcessNewItem(RE::FormID itemID, bool fromAppraisal = false)
     {
         Log("ProcessNewItem {:08X}", itemID);
 
@@ -989,10 +1053,10 @@ namespace
         }
         RE::TESBoundObject* baseObj = okWeap ? static_cast<RE::TESBoundObject*>(weap) : static_cast<RE::TESBoundObject*>(armo);
 
-        auto inv = player->GetInventory([baseObj](RE::TESBoundObject& o) { return &o == baseObj; });
-        auto it = inv.find(baseObj);
-        if (it == inv.end() || it->second.first < 1) {
-            Log("  item nao encontrado no inventario.");
+        RE::ExtraDataList* removeList = nullptr;
+        std::string        whyNot;
+        if (!FindRemovable(player, baseObj, removeList, &whyNot)) {
+            Log("  nenhuma unidade trocavel: {}.", whyNot);
             return false;
         }
 
@@ -1050,7 +1114,8 @@ namespace
         EnsureRefineRecipe(clone, okArmo, rarityIndex);
 
         // texto da janela de resultado
-        if (g_cfg.resultWindow && rarityIndex >= g_cfg.resultMinRarity) {
+        const bool showWindow = fromAppraisal ? g_cfg.appraiseWindow : (g_cfg.resultWindow && rarityIndex >= g_cfg.resultMinRarity);
+        if (showWindow) {
             std::string txt = std::format("[{}] {}\n", rec.rarity, baseObj->GetName());
             if (okWeap) {
                 auto* cw = clone->As<RE::TESObjectWEAP>();
@@ -1084,8 +1149,8 @@ namespace
         }
 
         // 4) trocar no inventario
-        player->RemoveItem(baseObj, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
-        Log("  item original removido");
+        player->RemoveItem(baseObj, 1, RE::ITEM_REMOVE_REASON::kRemove, removeList, nullptr);
+        Log("  item original removido{}", removeList ? " (unidade com dados extras inofensivos)" : "");
         player->AddObjectToContainer(clone, nullptr, 1, nullptr);
         Log("  copia adicionada ao inventario");
 
@@ -1118,27 +1183,6 @@ namespace
     {
         Log("Aviso ao jogador: {}", msg);
         RE::DebugNotification(msg);
-    }
-
-    // quantas unidades "simples" (sem dados extras: encantamento do jogador, aprimoramento, equipado...)
-    int PlainCount(RE::PlayerCharacter* player, RE::TESBoundObject* obj)
-    {
-        auto inv = player->GetInventory([obj](RE::TESBoundObject& o) { return &o == obj; });
-        auto it = inv.find(obj);
-        if (it == inv.end()) {
-            return 0;
-        }
-        const int               total = it->second.first;
-        int                     extra = 0;
-        RE::InventoryEntryData* entry = it->second.second.get();
-        if (entry && entry->extraLists) {
-            for (auto* list : *entry->extraLists) {
-                if (list) {
-                    extra += std::max<int>(1, list->GetCount());
-                }
-            }
-        }
-        return total - extra;
     }
 
     // FormID do item selecionado no inventario (le a lista da interface; funciona com SkyUI)
@@ -1192,9 +1236,14 @@ namespace
             Toast("So armas e armaduras podem ser avaliadas.");
             return;
         }
-        if (PlainCount(player, obj) < 1) {
-            Toast("Desequipe o item. Itens equipados, encantados por voce ou aprimorados nao podem ser avaliados.");
-            return;
+        {
+            RE::ExtraDataList* l = nullptr;
+            std::string        why;
+            if (!FindRemovable(player, obj, l, &why)) {
+                Log("Avaliador: item {:08X} recusado: {}.", id, why);
+                Toast("Este item nao pode ser avaliado agora (equipado, aprimorado, roubado ou com encantamento seu).");
+                return;
+            }
         }
 
         g_pendingAppraisal = id;
@@ -1210,7 +1259,7 @@ namespace
     {
         Log("Avaliador: inventario fechado, avaliando {:08X}.", id);
         g_busy = true;
-        const bool ok = ProcessNewItem(id);
+        const bool ok = ProcessNewItem(id, true);
         g_busy = false;
         g_cooldownUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
         if (!ok) {
@@ -1251,6 +1300,54 @@ namespace
             return RE::BSEventNotifyControl::kContinue;
         }
     };
+
+    // ------------------------------------------------------------------
+    // Devolver os itens originais (para desinstalar o mod com seguranca)
+    // ------------------------------------------------------------------
+    bool        g_revertArmed = false;
+    std::string g_revertStatus;  // protegida por g_summaryMutex
+
+    void RevertAllInInventory()
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return;
+        }
+        Log("Devolucao: iniciando.");
+        auto inv = player->GetInventory([](RE::TESBoundObject& o) { return g_clones.contains(o.GetFormID()); });
+        std::vector<std::pair<RE::TESBoundObject*, int>> work;
+        for (auto& [obj, data] : inv) {
+            work.emplace_back(obj, data.first);
+        }
+
+        int kinds = 0, units = 0, missing = 0;
+        g_busy = true;
+        for (auto& [obj, count] : work) {
+            auto  rec = g_clones.find(obj->GetFormID());
+            auto* base = rec != g_clones.end() ? RE::TESForm::LookupByID<RE::TESBoundObject>(rec->second.baseID) : nullptr;
+            if (!base) {
+                Log("  item {:08X}: o original nao foi encontrado (mod do item removido?). Mantido.", obj->GetFormID());
+                ++missing;
+                continue;
+            }
+            player->RemoveItem(obj, count, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+            player->AddObjectToContainer(base, nullptr, count, nullptr);
+            Log("  {:08X} x{} -> {:08X}", obj->GetFormID(), count, base->GetFormID());
+            ++kinds;
+            units += count;
+        }
+        g_busy = false;
+        g_cooldownUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+
+        const std::string msg = std::format("Devolvidos {} itens ({} tipos).{}", units, kinds,
+                                            missing > 0 ? std::format(" {} nao puderam ser devolvidos (veja o log).", missing) : "");
+        Log("Devolucao concluida: {}", msg);
+        {
+            std::lock_guard<std::mutex> lock(g_summaryMutex);
+            g_revertStatus = msg;
+        }
+        RE::DebugNotification(msg.c_str());
+    }
 
     class MenuSink : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
     {
@@ -1348,6 +1445,17 @@ namespace
         if (b && r.max < r.min) {
             r.min = r.max;
         }
+        ImGuiMCP::Spacing();
+        ImGuiMCP::PopID();
+    }
+
+    // slider com o titulo em cima, como os de minimo/maximo
+    void TitledSlider(const char* title, float* v, float lo, float hi, const char* fmt)
+    {
+        ImGuiMCP::PushID(title);
+        ImGuiMCP::Text("%s", title);
+        ImGuiMCP::SliderFloat("##v", v, lo, hi, fmt, 0);
+        ImGuiMCP::Spacing();
         ImGuiMCP::PopID();
     }
 
@@ -1364,8 +1472,8 @@ namespace
         ImGuiMCP::Checkbox("Afetar roupas", &g_cfg.affectClothing);
         ImGuiMCP::Checkbox("Afetar joias e acessorios", &g_cfg.affectJewelry);
         ImGuiMCP::Spacing();
-        ImGuiMCP::Checkbox("Mostrar janela com os atributos ao criar o item", &g_cfg.resultWindow);
-        ImGuiMCP::Text("Mostrar a janela a partir da raridade:");
+        ImGuiMCP::Checkbox("Janela de resultado ao FORJAR", &g_cfg.resultWindow);
+        ImGuiMCP::Text("Na forja, mostrar a janela a partir da raridade:");
         ImGuiMCP::Combo("##janelamin", &g_cfg.resultMinRarity, "Comum\0Rara\0Epica\0Lendaria\0Mitica\0");
         ImGuiMCP::SliderInt("Itens por janela", &g_cfg.resultMaxItems, 1, 5, "%d", 0);
         ImGuiMCP::TextWrapped("Os numeros da janela sao os valores BASE do item. No inventario o jogo soma o bonus de habilidades e perks.");
@@ -1408,9 +1516,41 @@ namespace
             ImGuiMCP::TextWrapped("Com o inventario aberto, selecione uma arma ou armadura que voce ja tem e aperte a tecla de avaliar. "
                                   "O inventario fecha, o item e trocado por uma versao com raridade, e a janela de resultado aparece.");
             ImGuiMCP::Checkbox("Ativar o avaliador", &g_cfg.appraiseEnabled);
+            ImGuiMCP::Checkbox("Janela de resultado ao AVALIAR (sempre aparece, de qualquer raridade)", &g_cfg.appraiseWindow);
             ImGuiMCP::TextWrapped("Tecla: codigo %d (AppraiseKey no .ini; 24 = O, 25 = P, 0 desliga). "
                                   "Digitar essa letra na busca do inventario tambem aciona.", g_cfg.appraiseKey);
-            ImGuiMCP::TextWrapped("Nao avalia: itens que ja tem raridade, equipados, encantados por voce ou aprimorados.");
+            ImGuiMCP::TextWrapped("Nao avalia: itens que ja tem raridade, equipados, aprimorados, roubados, com nome personalizado ou com encantamento feito por voce. Encantamentos que ja vem no item (de mod ou do jogo) sao mantidos.");
+        }
+        ImGuiMCP::Separator();
+
+        if (ImGuiMCP::CollapsingHeader("Desinstalar: devolver os itens originais")) {
+            ImGuiMCP::TextWrapped("Os itens com raridade ficam gravados no seu save e dependem deste mod. Antes de desinstalar, "
+                                  "devolva os originais. Isto troca cada item com raridade do SEU INVENTARIO pelo item original.");
+            ImGuiMCP::TextWrapped("Itens no chao, em baus ou com seguidores precisam ser recolhidos antes. "
+                                  "Melhorias e encantamentos feitos por voce nos itens com raridade sao PERDIDOS. Desequipe tudo antes.");
+            if (!g_revertArmed) {
+                if (ImGuiMCP::Button("Preparar devolucao")) {
+                    g_revertArmed = true;
+                }
+            } else {
+                ImGuiMCP::TextWrapped("Tem certeza? Esta acao nao pode ser desfeita.");
+                if (ImGuiMCP::Button("CONFIRMAR: devolver os originais")) {
+                    g_revertArmed = false;
+                    SKSE::GetTaskInterface()->AddTask([]() { RevertAllInInventory(); });
+                }
+                ImGuiMCP::SameLine();
+                if (ImGuiMCP::Button("Cancelar")) {
+                    g_revertArmed = false;
+                }
+            }
+            std::string status;
+            {
+                std::lock_guard<std::mutex> lock(g_summaryMutex);
+                status = g_revertStatus;
+            }
+            if (!status.empty()) {
+                ImGuiMCP::TextWrapped("%s", status.c_str());
+            }
         }
         ImGuiMCP::Separator();
 
@@ -1446,10 +1586,10 @@ namespace
             auto& r = g_cfg.rarities[i];
             ImGuiMCP::PushID(i);
             if (ImGuiMCP::CollapsingHeader(r.name.c_str())) {
-                ImGuiMCP::SliderFloat("Chance (peso relativo)", &r.chance, 0.0f, 100.0f, "%.1f", 0);
+                TitledSlider("Chance (peso relativo)", &r.chance, 0.0f, 100.0f, "%.1f");
                 RangeSliders("Dano (multiplicador)", r.damage, 0.5f, 8.0f);
                 RangeSliders("Valor de venda (multiplicador)", r.value, 0.5f, 8.0f);
-                ImGuiMCP::SliderFloat("Peso: divisor fixo", &r.weightDiv, 0.5f, 6.0f, "%.2f", 0);
+                TitledSlider("Peso (divisor fixo: 2 = metade do peso)", &r.weightDiv, 0.5f, 6.0f, "%.2f");
                 RangeSliders("Velocidade de ataque (multiplicador)", r.speed, 0.1f, 5.0f);
                 RangeSliders("Dano critico: bonus somado", r.critBonus, 0.0f, 6.0f);
                 RangeSliders("Defesa de armadura (multiplicador)", r.armor, 0.5f, 5.0f);
