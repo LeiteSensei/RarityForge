@@ -1,22 +1,21 @@
-// Overgeared v3 - PROTOTIPO de copias
+// Overgeared - rarity for crafted and appraised weapons, armor, clothing and accessories
 //
-// Quando o jogador forja uma ARMA, o plugin:
-//   1) sorteia uma raridade (Comum, Rara, Epica, Lendaria, Mitica);
-//   2) cria uma COPIA da arma (um item novo, so do jogador);
-//   3) aplica os atributos da raridade:
-//      - dano, valor, velocidade de ataque e bonus de critico: sorteados
-//        dentro da faixa da raridade (o dano critico acompanha o dano novo);
-//      - peso: reducao FIXA por raridade (a arma fica X vezes mais leve);
-//   4) troca a arma forjada pela copia no inventario.
+// When the player crafts an item (or appraises one from the inventory), the plugin:
+//   1) rolls a rarity (Common, Rare, Epic, Legendary, Mythic);
+//   2) creates a COPY of the item (a new form, only for the player);
+//   3) applies the rarity's stats:
+//      - damage, value, attack speed and critical bonus (weapons) / defense (armor):
+//        rolled inside the rarity's range (critical damage follows the new damage);
+//      - weight: FIXED reduction per rarity (the item gets X times lighter);
+//   4) swaps the original item for the copy in the inventory.
 //
-// Como o jogo nao grava sozinho os dados dessas copias, o plugin guarda uma
-// lista (num arquivo ao lado do save, o "cosave") e refaz os dados ao carregar.
+// The game does not save the data of these copies by itself, so the plugin keeps a
+// list (in a file next to the save, the "cosave") and rebuilds the data on load.
 //
-// Nesta versao: armas E armaduras (joias ficam para depois).
-// Armaduras: a defesa recebe um multiplicador por raridade, limitado por
-// um bonus maximo em relacao a base e por um teto de defesa por tipo de peca.
+// Armor: defense gets a per-rarity multiplier, limited by a maximum bonus over the
+// base and by a defense cap per piece type.
 //
-// IMPORTANTE: codigo NAO testado. Veja o texto que acompanha.
+// Improvement recipes (grindstone / armor workbench) are created per rarity.
 
 #define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
 
@@ -45,17 +44,17 @@
 #include <unordered_map>
 #include <unordered_set>
 
-// Cabecalho do SKSE Menu Framework (baixado da pagina do mod no Nexus).
-// Precisa estar na mesma pasta que este arquivo.
+// SKSE Menu Framework header (downloaded from the mod's Nexus page).
+// It must be in the same folder as this file.
 #include "SKSEMenuFramework.h"
 
 namespace
 {
     // ------------------------------------------------------------------
-    // Log (grava em dois lugares para facilitar achar)
+    // Log (written to two places so it is easy to find)
     // ------------------------------------------------------------------
-    std::ofstream g_logA;  // pasta de logs do SKSE (Documentos/My Games/...)
-    std::ofstream g_logB;  // Data/SKSE/Plugins (no MO2, vai para a pasta Overwrite)
+    std::ofstream g_logA;  // SKSE log folder (Documents/My Games/...)
+    std::ofstream g_logB;  // Data/SKSE/Plugins (with MO2 this ends up in the Overwrite folder)
 
     void WriteLog(const std::string& s)
     {
@@ -88,11 +87,11 @@ namespace
             OpenLogFile(g_logA, *folder / "Overgeared.log");
         }
         OpenLogFile(g_logB, std::filesystem::path("Data") / "SKSE" / "Plugins" / "Overgeared.log");
-        Log("Overgeared v3 (prototipo de copias) iniciado.");
+        Log("Overgeared started.");
     }
 
     // ------------------------------------------------------------------
-    // Configuracao
+    // Configuration
     // ------------------------------------------------------------------
     struct Range
     {
@@ -103,51 +102,73 @@ namespace
     struct RarityDef
     {
         std::string name;
-        float       chance;     // chance relativa
-        Range       damage;     // multiplicador de dano
-        Range       value;      // multiplicador de valor de venda
-        float       weightDiv;  // divisor do peso (fixo): 2.0 = metade do peso
-        Range       speed;      // multiplicador de velocidade de ataque
-        Range       critBonus;  // bonus somado ao multiplicador do dano critico (1 + bonus)
-        Range       armor;      // multiplicador de defesa (armaduras)
+        float       chance;     // relative chance
+        Range       damage;     // damage multiplier
+        Range       value;      // sell value multiplier
+        float       weightDiv;  // weight divisor (fixed): 2.0 = half the weight
+        Range       speed;      // attack speed multiplier
+        Range       critBonus;  // bonus added to the critical damage multiplier (1 + bonus)
+        Range       armor;      // defense multiplier (armor)
     };
+
+    struct Ingredient
+    {
+        std::string   plugin;  // plugin that owns the item (e.g. "Skyrim.esm")
+        std::uint32_t id;      // local FormID inside that plugin
+        int           count;
+    };
+
+    // Default recipes (all items are from Skyrim.esm; soul gems are the FILLED versions).
+    inline std::array<std::vector<Ingredient>, 5> DefaultRecipes()
+    {
+        const std::string sk = "Skyrim.esm";
+        return { {
+            { { sk, 0x0005ACE4, 3 } },                                                                              // Common: 3 Iron Ingot
+            { { sk, 0x0005ACE4, 5 }, { sk, 0x000DB8A2, 2 } },                                                       // Rare: 5 Iron, 2 Dwarven
+            { { sk, 0x000DB8A2, 5 }, { sk, 0x0005AD9E, 5 }, { sk, 0x0002E4F3, 1 } },                                // Epic: 5 Dwarven, 5 Gold, 1 Common Soul Gem (filled)
+            { { sk, 0x0005AD9E, 10 }, { sk, 0x0005ADA1, 5 }, { sk, 0x0002E4FF, 1 } },                               // Legendary: 10 Gold, 5 Malachite, 1 Grand Soul Gem (filled)
+            { { sk, 0x0005AD9D, 15 }, { sk, 0x0005ADA1, 5 }, { sk, 0x0005AD99, 5 }, { sk, 0x0002E504, 1 } },        // Mythic: 15 Ebony, 5 Malachite, 5 Orichalcum, 1 Black Soul Gem (filled)
+        } };
+    }
 
     struct Config
     {
         std::array<RarityDef, 5> rarities{ {
-            { "Comum", 60.0f, { 1.00f, 1.24f }, { 1.00f, 1.10f }, 1.00f, { 1.00f, 1.24f }, { 0.00f, 0.50f }, { 1.00f, 1.10f } },
-            { "Rara", 25.0f, { 1.25f, 1.74f }, { 1.10f, 1.30f }, 1.25f, { 1.25f, 1.49f }, { 0.50f, 1.00f }, { 1.10f, 1.25f } },
-            { "Epica", 10.0f, { 1.75f, 2.99f }, { 1.30f, 1.60f }, 1.75f, { 1.50f, 1.74f }, { 1.00f, 1.50f }, { 1.25f, 1.45f } },
-            { "Lendaria", 4.0f, { 3.00f, 4.99f }, { 1.60f, 1.99f }, 2.25f, { 1.75f, 1.99f }, { 1.50f, 2.00f }, { 1.45f, 1.75f } },
-            { "Mitica", 1.0f, { 5.00f, 5.00f }, { 2.00f, 2.00f }, 3.00f, { 2.00f, 2.00f }, { 2.00f, 2.00f }, { 2.00f, 2.00f } },
+            { "Common", 60.0f, { 1.00f, 1.24f }, { 1.00f, 1.10f }, 1.00f, { 1.00f, 1.24f }, { 0.00f, 0.50f }, { 1.00f, 1.10f } },
+            { "Rare", 25.0f, { 1.25f, 1.74f }, { 1.10f, 1.30f }, 1.25f, { 1.25f, 1.49f }, { 0.50f, 1.00f }, { 1.10f, 1.25f } },
+            { "Epic", 10.0f, { 1.75f, 2.99f }, { 1.30f, 1.60f }, 1.75f, { 1.50f, 1.74f }, { 1.00f, 1.50f }, { 1.25f, 1.45f } },
+            { "Legendary", 4.0f, { 3.00f, 4.99f }, { 1.60f, 1.99f }, 2.25f, { 1.75f, 1.99f }, { 1.50f, 2.00f }, { 1.45f, 1.75f } },
+            { "Mythic", 1.0f, { 5.00f, 5.00f }, { 2.00f, 2.00f }, 3.00f, { 2.00f, 2.00f }, { 2.00f, 2.00f }, { 2.00f, 2.00f } },
         } };
         bool onlyWhenCrafting = true;
         bool notify = true;
         bool affectWeapons = true;
         bool affectArmor = true;
-        bool affectClothing = true;  // roupas (palavra-chave ArmorClothing)
-        bool affectJewelry = true;   // joias e acessorios (aneis, amuletos, oculos etc.)
+        bool affectClothing = true;  // clothing (ArmorClothing keyword)
+        bool affectJewelry = true;   // jewelry and accessories (rings, amulets, glasses, etc.)
 
-        // Janela de resultado depois de forjar
+        // Result window after crafting
         bool resultWindow = true;
-        int  resultMinRarity = 0;  // 0 = Comum ... 4 = Mitica: a janela aparece a partir desta raridade
-        int  resultMaxItems = 2;   // quantos itens cabem na mesma caixa (o resto vira "+N anteriores")
+        int  resultMinRarity = 0;  // 0 = Common ... 4 = Mythic: the window appears from this rarity up
+        int  resultMaxItems = 2;   // how many items fit in one box (the rest becomes "+N earlier")
 
-        // Avaliador: tecla no inventario que sorteia a raridade de um item que voce ja tem
+        // Appraiser: inventory key that rolls the rarity of an item you already own
         bool appraiseEnabled = true;
-        bool appraiseWindow = true;  // janela de resultado ao avaliar (sempre, de qualquer raridade)
-        int  appraiseKey = 0x18;  // tecla O (codigo DirectInput)
+        bool appraiseWindow = true;  // result window when appraising (always shown, any rarity)
+        int  appraiseKey = 0x18;  // O key (DirectInput code)
 
-        // Receita de refino (teste): permite melhorar o item na pedra de amolar / mesa de armaduras
-        bool          refineEnabled = true;
-        int           refineMinRarity = 2;  // 0-based: 2 = Epica
-        int           refineMaxRarity = 2;
-        std::uint32_t refineItemID = 0x0005ACE4;  // Lingote de Ferro (Skyrim.esm), so para teste
-        int           refineItemCount = 1;
+        // Improvement recipes: lets rarity items be improved at the grindstone / armor workbench.
+        // One recipe per rarity (the game reuses the same recipe for every improvement step).
+        bool                                  refineEnabled = true;
+        std::array<std::vector<Ingredient>, 5> recipes = DefaultRecipes();
 
-        // Armaduras: limites de defesa
-        float armorMaxMult = 2.0f;  // bonus maximo em relacao a defesa base (0 = sem limite)
-        // teto de defesa EXIBIDA por tipo de peca (0 = sem teto). Nunca reduz uma peca abaixo da base.
+        // Appraiser: block items that would lose data when swapped (upgraded, stolen, player-enchanted, renamed, poisoned).
+        // Equipped items are always blocked.
+        bool blockLossyItems = false;
+
+        // Armor: defense limits
+        float armorMaxMult = 2.0f;  // maximum bonus relative to base defense (0 = no limit)
+        // DISPLAYED defense cap per piece type (0 = no cap). Never lowers a piece below its base.
         float capBody = 80.0f;
         float capHead = 45.0f;
         float capHands = 45.0f;
@@ -159,9 +180,9 @@ namespace
     Config g_cfg;
 
     bool        g_craftingMenuOpen = false;
-    int         g_forceRarity = 0;  // 0 = aleatoria; 1..5 = forca a raridade (para testes)
+    int         g_forceRarity = 0;  // 0 = random; 1..5 = forces that rarity (for testing)
     std::mutex  g_summaryMutex;
-    std::string g_lastSummary = "(nenhum item forjado ainda)";
+    std::string g_lastSummary = "(no item crafted yet)";
 
     std::string Trim(std::string s)
     {
@@ -179,11 +200,48 @@ namespace
         return v == "1" || v == "true" || v == "True" || v == "TRUE";
     }
 
+    // "[plugin|]hexid:count, [plugin|]hexid:count, ..."  (plugin defaults to Skyrim.esm)
+    std::vector<Ingredient> ParseRecipe(const std::string& text)
+    {
+        std::vector<Ingredient> out;
+        std::size_t             pos = 0;
+        while (pos <= text.size()) {
+            auto        comma = text.find(',', pos);
+            std::string tok = Trim(text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
+            pos = comma == std::string::npos ? text.size() + 1 : comma + 1;
+            if (tok.empty()) {
+                continue;
+            }
+            Ingredient ing{ "Skyrim.esm", 0, 1 };
+            auto       bar = tok.find('|');
+            if (bar != std::string::npos) {
+                ing.plugin = Trim(tok.substr(0, bar));
+                tok = Trim(tok.substr(bar + 1));
+            }
+            auto colon = tok.find(':');
+            ing.id = static_cast<std::uint32_t>(std::stoul(tok.substr(0, colon), nullptr, 16));
+            if (colon != std::string::npos) {
+                ing.count = std::max(1, std::stoi(tok.substr(colon + 1)));
+            }
+            out.push_back(ing);
+        }
+        return out;
+    }
+
+    std::string FormatRecipe(const std::vector<Ingredient>& recipe)
+    {
+        std::string out;
+        for (std::size_t i = 0; i < recipe.size(); ++i) {
+            out += std::format("{}{}|{:08X}:{}", i ? ", " : "", recipe[i].plugin, recipe[i].id, recipe[i].count);
+        }
+        return out;
+    }
+
     void LoadConfig()
     {
         std::ifstream file("Data\\SKSE\\Plugins\\Overgeared.ini");
         if (!file.is_open()) {
-            Log("Overgeared.ini nao encontrado, usando valores padrao.");
+            Log("Overgeared.ini not found, using default values.");
             return;
         }
 
@@ -223,14 +281,10 @@ namespace
                     g_cfg.appraiseKey = std::stoi(val);
                 } else if (key == "RefineEnabled") {
                     g_cfg.refineEnabled = ToBool(val);
-                } else if (key == "RefineMinRarity") {
-                    g_cfg.refineMinRarity = std::clamp(std::stoi(val) - 1, 0, 4);
-                } else if (key == "RefineMaxRarity") {
-                    g_cfg.refineMaxRarity = std::clamp(std::stoi(val) - 1, 0, 4);
-                } else if (key == "RefineItemID") {
-                    g_cfg.refineItemID = static_cast<std::uint32_t>(std::stoul(val, nullptr, 0));
-                } else if (key == "RefineItemCount") {
-                    g_cfg.refineItemCount = std::max(1, std::stoi(val));
+                } else if (key == "BlockLossyItems") {
+                    g_cfg.blockLossyItems = ToBool(val);
+                } else if (key.rfind("RefineRecipe", 0) == 0 && key.size() == 13 && key[12] >= '1' && key[12] <= '5') {
+                    g_cfg.recipes[key[12] - '1'] = ParseRecipe(val);
                 } else if (key == "AffectClothing") {
                     g_cfg.affectClothing = ToBool(val);
                 } else if (key == "AffectJewelry") {
@@ -269,35 +323,38 @@ namespace
                     }
                 }
             } catch (...) {
-                Log("Valor invalido no ini: {} = {}", key, val);
+                Log("Invalid value in ini: {} = {}", key, val);
             }
         }
-        Log("Configuracao carregada.");
+        Log("Configuration loaded.");
     }
 
     bool SaveConfig()
     {
         std::ofstream f("Data\\SKSE\\Plugins\\Overgeared.ini", std::ios::out | std::ios::trunc);
         if (!f.is_open()) {
-            Log("ERRO: nao foi possivel gravar o Overgeared.ini");
+            Log("ERROR: could not write Overgeared.ini");
             return false;
         }
-        f << "; Overgeared - configuracao salva pelo menu do jogo\n";
-        f << "; Damage/Value/Speed = multiplicador sorteado entre Min e Max\n";
-        f << "; WeightDivisor = peso dividido por este valor (fixo)\n";
-        f << "; CritBonus = bonus somado ao multiplicador do dano critico (1 + bonus)\n\n";
+        f << "; Overgeared - configuration saved from the in-game menu\n";
+        f << "; Damage/Value/Speed/Armor = multiplier rolled between Min and Max\n";
+        f << "; WeightDivisor = weight is divided by this value (fixed)\n";
+        f << "; CritBonus = bonus added to the critical damage multiplier (1 + bonus)\n\n";
         f << std::format("OnlyWhenCrafting={}\nNotify={}\n", g_cfg.onlyWhenCrafting ? 1 : 0, g_cfg.notify ? 1 : 0);
         f << std::format("AffectWeapons={}\nAffectArmor={}\n", g_cfg.affectWeapons ? 1 : 0, g_cfg.affectArmor ? 1 : 0);
         f << std::format("AffectClothing={}\nAffectJewelry={}\n", g_cfg.affectClothing ? 1 : 0, g_cfg.affectJewelry ? 1 : 0);
-        f << "; Janela de resultado: ResultMinRarity 1=Comum 2=Rara 3=Epica 4=Lendaria 5=Mitica\n";
+        f << "; Result window: ResultMinRarity 1=Common 2=Rare 3=Epic 4=Legendary 5=Mythic\n";
         f << std::format("ResultWindow={}\nResultMinRarity={}\nResultMaxItems={}\n", g_cfg.resultWindow ? 1 : 0, g_cfg.resultMinRarity + 1, g_cfg.resultMaxItems);
-        f << "; Avaliador: AppraiseKey = codigo de tecla DirectInput (24 = O, 25 = P, 0 = desligada)\n";
+        f << "; Appraiser: AppraiseKey = DirectInput key code (24 = O, 25 = P, 0 = disabled)\n";
         f << std::format("AppraiseEnabled={}\nAppraiseWindow={}\nAppraiseKey={}\n", g_cfg.appraiseEnabled ? 1 : 0, g_cfg.appraiseWindow ? 1 : 0, g_cfg.appraiseKey);
-        f << "; Refino (teste): faixa de raridades que ganham receita, e o item exigido (FormID em hexadecimal)\n";
-        f << std::format("RefineEnabled={}\nRefineMinRarity={}\nRefineMaxRarity={}\nRefineItemID=0x{:08X}\nRefineItemCount={}\n",
-                         g_cfg.refineEnabled ? 1 : 0, g_cfg.refineMinRarity + 1, g_cfg.refineMaxRarity + 1, g_cfg.refineItemID, g_cfg.refineItemCount);
-        f << "; Armaduras: ArmorMaxMultiplier = bonus maximo de defesa vs a base (0 = sem limite)\n";
-        f << "; Cap* = teto de defesa exibida por tipo de peca (0 = sem teto)\n";
+        f << "; Improvement recipes: one line per rarity, format [plugin|]hexFormID:count, ...\n";
+        f << std::format("RefineEnabled={}\n", g_cfg.refineEnabled ? 1 : 0);
+        for (int i = 0; i < 5; ++i) {
+            f << std::format("RefineRecipe{}={}\n", i + 1, FormatRecipe(g_cfg.recipes[i]));
+        }
+        f << std::format("BlockLossyItems={}\n", g_cfg.blockLossyItems ? 1 : 0);
+        f << "; Armor: ArmorMaxMultiplier = maximum defense bonus vs the base (0 = no limit)\n";
+        f << "; Cap* = displayed defense cap per piece type (0 = no cap)\n";
         f << std::format("ArmorMaxMultiplier={:.2f}\n", g_cfg.armorMaxMult);
         f << std::format("CapBody={:.0f}\nCapHead={:.0f}\nCapHands={:.0f}\nCapFeet={:.0f}\nCapShield={:.0f}\nCapOther={:.0f}\n\n",
                          g_cfg.capBody, g_cfg.capHead, g_cfg.capHands, g_cfg.capFeet, g_cfg.capShield, g_cfg.capOther);
@@ -312,12 +369,12 @@ namespace
             f << std::format("CritBonusMin{0}={1:.2f}\nCritBonusMax{0}={2:.2f}\n", n, r.critBonus.min, r.critBonus.max);
             f << std::format("ArmorMin{0}={1:.2f}\nArmorMax{0}={2:.2f}\n\n", n, r.armor.min, r.armor.max);
         }
-        Log("Overgeared.ini gravado pelo menu.");
+        Log("Overgeared.ini saved from the menu.");
         return true;
     }
 
     // ------------------------------------------------------------------
-    // Sorteio
+    // Rolling
     // ------------------------------------------------------------------
     std::mt19937& Rng()
     {
@@ -325,7 +382,7 @@ namespace
         return rng;
     }
 
-    // sorteia em passos de 0.01 dentro da faixa
+    // rolls in 0.01 steps within the range
     float RollRange(const Range& r)
     {
         const int lo = static_cast<int>(std::lround(r.min * 100.0f));
@@ -338,7 +395,9 @@ namespace
     }
 
     // ------------------------------------------------------------------
-    // Registro das copias (o que precisa sobreviver ao salvar/carregar)
+    int RarityIndexByName(const std::string& name);  // defined below
+
+    // Registry of copies (what must survive saving/loading)
     // ------------------------------------------------------------------
     struct CloneRecord
     {
@@ -346,19 +405,19 @@ namespace
         std::string rarity;
         float       damage{ 1.0f };
         float       value{ 1.0f };
-        float       weightDiv{ 1.0f };  // peso dividido por isto
-        float       crit{ 1.0f };       // multiplicador final do DANO CRITICO (1 + bonus)
+        float       weightDiv{ 1.0f };  // weight is divided by this
+        float       crit{ 1.0f };       // final CRITICAL DAMAGE multiplier (1 + bonus)
         float       speed{ 1.0f };
         bool          isArmor{ false };
-        float         armor{ 1.0f };    // multiplicador de defesa sorteado (armaduras)
-        std::uint32_t armorFinal{ 0 };  // defesa final gravada (ja com os limites aplicados)
+        float         armor{ 1.0f };    // rolled defense multiplier (armor)
+        std::uint32_t armorFinal{ 0 };  // stored final defense (limits already applied)
     };
 
-    std::unordered_map<RE::FormID, CloneRecord> g_clones;  // chave: FormID da copia
-    std::unordered_set<RE::FormID>              g_built;   // copias ja montadas nesta sessao
+    std::unordered_map<RE::FormID, CloneRecord> g_clones;  // key: FormID of the copy
+    std::unordered_set<RE::FormID>              g_built;   // copies already built this session
 
-    // O Copy() da biblioteca nao copia o modelo, o tipo de animacao etc.
-    // Por isso copiamos cada parte da arma explicitamente.
+    // The library's Copy() does not copy the model, animation type, etc.
+    // So we copy each part of the weapon explicitly.
     template <class T>
     void CopyComp(RE::TESObjectWEAP* dst, RE::TESObjectWEAP* src)
     {
@@ -369,7 +428,7 @@ namespace
 
     void CopyWeaponParts(RE::TESObjectWEAP* dst, RE::TESObjectWEAP* src)
     {
-        // caixa de limites do objeto (a parte propria do TESBoundObject, logo apos o TESForm)
+        // object bounds (the part specific to TESBoundObject, right after TESForm)
         {
             auto*             dstB = reinterpret_cast<std::byte*>(static_cast<RE::TESForm*>(dst)) + sizeof(RE::TESForm);
             auto*             srcB = reinterpret_cast<std::byte*>(static_cast<RE::TESForm*>(src)) + sizeof(RE::TESForm);
@@ -377,7 +436,7 @@ namespace
             std::memcpy(dstB, srcB, sizeB);
         }
 
-        // componentes (modelo, equipamento, sons, palavras-chave...)
+        // components (model, equip type, sounds, keywords...)
         CopyComp<RE::TESFullName>(dst, src);
         CopyComp<RE::TESModelTextureSwap>(dst, src);
         CopyComp<RE::TESIcon>(dst, src);
@@ -394,17 +453,17 @@ namespace
         CopyComp<RE::BGSKeywordForm>(dst, src);
         CopyComp<RE::TESDescription>(dst, src);
 
-        // campos proprios da arma (tipo de animacao, alcance, velocidade, sons de ataque...):
-        // tudo o que vem depois do ultimo componente
+        // weapon-specific fields (animation type, reach, speed, attack sounds...):
+        // everything that comes after the last component
         auto*             dstTail = reinterpret_cast<std::byte*>(static_cast<RE::TESDescription*>(dst)) + sizeof(RE::TESDescription);
         auto*             srcTail = reinterpret_cast<std::byte*>(static_cast<RE::TESDescription*>(src)) + sizeof(RE::TESDescription);
         const std::size_t offset = static_cast<std::size_t>(dstTail - reinterpret_cast<std::byte*>(dst));
         const std::size_t size = sizeof(RE::TESObjectWEAP) - offset;
         std::memcpy(dstTail, srcTail, size);
-        Log("  partes copiadas: campos proprios a partir do deslocamento 0x{:X}, {} bytes", offset, size);
+        Log("  parts copied: own fields from offset 0x{:X}, {} bytes", offset, size);
     }
 
-    // Preenche (ou refaz) a copia a partir da arma original + multiplicadores.
+    // Fills (or rebuilds) the copy from the original weapon + multipliers.
     bool BuildClone(RE::TESObjectWEAP* clone, RE::TESObjectWEAP* base, const CloneRecord& rec)
     {
         if (!clone || !base) {
@@ -420,9 +479,9 @@ namespace
         clone->attackDamage = std::max<std::uint16_t>(1, rnd16(static_cast<float>(base->attackDamage) * rec.damage));
         clone->value = std::max<std::int32_t>(1, static_cast<std::int32_t>(std::lround(static_cast<float>(base->value) * rec.value)));
         clone->weight = std::max(0.0f, base->weight / std::max(0.01f, rec.weightDiv));
-        // O dano critico acompanha o dano NOVO da arma, mantendo a proporcao que a
-        // arma original tinha (na maioria das armas e metade do dano), e so entao
-        // aplica o bonus de critico da raridade.
+        // Critical damage follows the weapon's NEW damage, keeping the ratio the
+        // original weapon had (half the damage on most weapons), and only then
+        // applies the rarity's critical bonus.
         {
             const float baseDmg = static_cast<float>(base->attackDamage);
             const float ratio = baseDmg > 0.0f ? static_cast<float>(base->criticalData.damage) / baseDmg : 0.5f;
@@ -433,7 +492,7 @@ namespace
         const std::string newName = std::format("[{}] {}", rec.rarity, base->GetName());
         clone->fullName = newName.c_str();
 
-        Log("  copia {:08X} de {:08X}: nome='{}' dano {}->{} valor {}->{} peso {:.2f}->{:.2f} crit {}->{} vel {:.2f}->{:.2f} palavras-chave={} modelo='{}'",
+        Log("  copy {:08X} of {:08X}: name='{}' damage {}->{} value {}->{} weight {:.2f}->{:.2f} crit {}->{} speed {:.2f}->{:.2f} keywords={} model='{}'",
             clone->GetFormID(), base->GetFormID(), newName,
             base->attackDamage, clone->attackDamage,
             base->value, clone->value,
@@ -441,18 +500,18 @@ namespace
             base->criticalData.damage, clone->criticalData.damage,
             base->weaponData.speed, clone->weaponData.speed,
             clone->numKeywords,
-            clone->GetModel() ? clone->GetModel() : "(sem modelo)");
+            clone->GetModel() ? clone->GetModel() : "(no model)");
         g_built.insert(clone->GetFormID());
         return true;
     }
 
     // ------------------------------------------------------------------
-    // Armaduras
+    // Armor
     // ------------------------------------------------------------------
-    constexpr float kRatingScale = 100.0f;  // o jogo guarda a defesa multiplicada por 100
+    constexpr float kRatingScale = 100.0f;  // the game stores defense multiplied by 100
 
-    // Para cada classe candidata a "parte" da armadura: se a armadura realmente a
-    // herda, copia o componente; se nao herda, ignora (sem erro de compilacao).
+    // For each candidate "part" class of the armor: if the armor actually inherits
+    // it, copy the component; otherwise skip it (no compile error).
     template <class T, class Derived>
     int CopyCompIfBase(Derived* dst, Derived* src)
     {
@@ -466,7 +525,7 @@ namespace
         }
     }
 
-    // Onde termina (em bytes, a partir do inicio do objeto) a parte T da armadura.
+    // Where part T of the armor ends (in bytes, from the start of the object).
     template <class T, class Derived>
     std::size_t SubobjectEnd(Derived* obj)
     {
@@ -480,7 +539,7 @@ namespace
 
     void CopyArmorParts(RE::TESObjectARMO* dst, RE::TESObjectARMO* src)
     {
-        // caixa de limites do objeto
+        // object bounds
         {
             auto*             dstB = reinterpret_cast<std::byte*>(static_cast<RE::TESForm*>(dst)) + sizeof(RE::TESForm);
             auto*             srcB = reinterpret_cast<std::byte*>(static_cast<RE::TESForm*>(src)) + sizeof(RE::TESForm);
@@ -507,7 +566,7 @@ namespace
         copied += CopyCompIfBase<RE::BGSMessageIcon>(dst, src);
         copied += CopyCompIfBase<RE::BGSPreloadable>(dst, src);
 
-        // fim do ultimo componente = inicio dos campos proprios da armadura
+        // end of the last component = start of the armor's own fields
         const std::size_t end = std::max({
             SubobjectEnd<RE::TESBoundObject>(dst),
             SubobjectEnd<RE::TESFullName>(dst),
@@ -532,7 +591,7 @@ namespace
         if (end < total) {
             std::memcpy(reinterpret_cast<std::byte*>(dst) + end, reinterpret_cast<std::byte*>(src) + end, total - end);
         }
-        Log("  partes copiadas (armadura): {} componentes; campos proprios a partir de 0x{:X}, {} bytes (tamanho total 0x{:X})",
+        Log("  parts copied (armor): {} components; own fields from 0x{:X}, {} bytes (total size 0x{:X})",
             copied, end, total > end ? total - end : 0, total);
     }
 
@@ -568,8 +627,8 @@ namespace
         Other
     };
 
-    // slots: 30 cabeca(bit0) 31 cabelo(1) 32 corpo(2) 33 maos(3) 34 antebracos(4)
-    //        35 amuleto(5) 36 anel(6) 37 pes(7) 38 canelas(8) 39 escudo(9) 42 diadema(12)
+    // slots: 30 head(bit0) 31 hair(1) 32 body(2) 33 hands(3) 34 forearms(4)
+    //        35 amulet(5) 36 ring(6) 37 feet(7) 38 calves(8) 39 shield(9) 42 circlet(12)
     ArmorCat Categorize(RE::TESObjectARMO* a)
     {
         const std::uint32_t m = SlotMask(a);
@@ -584,12 +643,12 @@ namespace
     const char* CatName(ArmorCat c)
     {
         switch (c) {
-        case ArmorCat::Body: return "peitoral";
-        case ArmorCat::Head: return "cabeca";
-        case ArmorCat::Hands: return "maos";
-        case ArmorCat::Feet: return "pes";
-        case ArmorCat::Shield: return "escudo";
-        default: return "outro";
+        case ArmorCat::Body: return "chest";
+        case ArmorCat::Head: return "head";
+        case ArmorCat::Hands: return "hands";
+        case ArmorCat::Feet: return "feet";
+        case ArmorCat::Shield: return "shield";
+        default: return "other";
         }
     }
 
@@ -613,26 +672,26 @@ namespace
         auto*               kw = static_cast<RE::BGSKeywordForm*>(a);
         const std::uint32_t m = SlotMask(a);
 
-        // peca "de armadura de verdade": ocupa cabeca, corpo, maos, pes ou escudo
+        // "real armor" piece: occupies head, body, hands, feet or shield
         const bool wornArmor = (m & ((1u << 0) | (1u << 2) | (1u << 3) | (1u << 7) | (1u << 9))) != 0;
         const bool jewelry = !wornArmor && (HasKeywordId(kw, "ArmorJewelry") || (m & ((1u << 5) | (1u << 6))) != 0);
         const bool clothing = !wornArmor && !jewelry && HasKeywordId(kw, "ArmorClothing");
 
         if (jewelry && !g_cfg.affectJewelry) {
-            Log("  armadura {:08X} ignorada: joia/acessorio desligado no menu (espacos 0x{:X})", a->GetFormID(), m);
+            Log("  armor {:08X} ignored: jewelry/accessories turned off in the menu (slots 0x{:X})", a->GetFormID(), m);
             return false;
         }
         if (clothing && !g_cfg.affectClothing) {
-            Log("  armadura {:08X} ignorada: roupa desligada no menu (espacos 0x{:X})", a->GetFormID(), m);
+            Log("  armor {:08X} ignored: clothing turned off in the menu (slots 0x{:X})", a->GetFormID(), m);
             return false;
         }
-        // Pecas sem defesa tambem entram: nome, valor e peso recebem a raridade,
-        // so a defesa continua zero.
+        // Pieces with no defense are included too: name, value and weight get the rarity,
+        // only the defense stays at zero.
         return true;
     }
 
-    // defesa final: multiplicador sorteado, limitado pelo bonus maximo e pelo teto da peca.
-    // O teto nunca faz a peca ficar abaixo da defesa que ela ja tinha.
+    // final defense: rolled multiplier, limited by the maximum bonus and by the piece's cap.
+    // The cap never makes a piece end up below the defense it already had.
     std::uint32_t ComputeArmorRating(RE::TESObjectARMO* base, float mult)
     {
         const float baseRating = static_cast<float>(base->armorRating);
@@ -665,7 +724,7 @@ namespace
         const std::string newName = std::format("[{}] {}", rec.rarity, base->GetName());
         clone->fullName = newName.c_str();
 
-        Log("  armadura {:08X} de {:08X}: nome='{}' tipo={} defesa {:.1f}->{:.1f} (exibida; bruto {}->{}) valor {}->{} peso {:.2f}->{:.2f} palavras-chave={}",
+        Log("  armor {:08X} of {:08X}: name='{}' type={} defense {:.1f}->{:.1f} (displayed; raw {}->{}) value {}->{} weight {:.2f}->{:.2f} keywords={}",
             clone->GetFormID(), base->GetFormID(), newName, CatName(Categorize(base)),
             static_cast<float>(base->armorRating) / kRatingScale, static_cast<float>(clone->armorRating) / kRatingScale,
             base->armorRating, clone->armorRating,
@@ -678,20 +737,20 @@ namespace
 
     void RepopulateAll(const char* reason)
     {
-        Log("Refazendo copias ({}): {} registradas.", reason, g_clones.size());
+        Log("Rebuilding copies ({}): {} registered.", reason, g_clones.size());
         for (auto& [cloneID, rec] : g_clones) {
             if (g_built.contains(cloneID)) {
-                continue;  // ja montada nesta sessao
+                continue;  // already built this session
             }
             if (rec.isArmor) {
                 auto* aClone = RE::TESForm::LookupByID<RE::TESObjectARMO>(cloneID);
                 auto* aBase = RE::TESForm::LookupByID<RE::TESObjectARMO>(rec.baseID);
                 if (!aClone) {
-                    Log("  armadura {:08X} nao existe mais no jogo (ignorada).", cloneID);
+                    Log("  armor {:08X} no longer exists in the game (ignored).", cloneID);
                     continue;
                 }
                 if (!aBase) {
-                    Log("  armadura original {:08X} nao encontrada (mod removido?). Copia {:08X} ignorada.", rec.baseID, cloneID);
+                    Log("  original armor {:08X} not found (mod removed?). Copy {:08X} ignored.", rec.baseID, cloneID);
                     continue;
                 }
                 BuildArmorClone(aClone, aBase, rec);
@@ -700,11 +759,11 @@ namespace
             auto* clone = RE::TESForm::LookupByID<RE::TESObjectWEAP>(cloneID);
             auto* base = RE::TESForm::LookupByID<RE::TESObjectWEAP>(rec.baseID);
             if (!clone) {
-                Log("  copia {:08X} nao existe mais no jogo (ignorada).", cloneID);
+                Log("  copy {:08X} no longer exists in the game (ignored).", cloneID);
                 continue;
             }
             if (!base) {
-                Log("  arma original {:08X} nao encontrada (mod removido?). Copia {:08X} ignorada.", rec.baseID, cloneID);
+                Log("  original weapon {:08X} not found (mod removed?). Copy {:08X} ignored.", rec.baseID, cloneID);
                 continue;
             }
             BuildClone(clone, base, rec);
@@ -712,7 +771,7 @@ namespace
     }
 
     // ------------------------------------------------------------------
-    // Gravacao junto do save (cosave)
+    // Saving alongside the save game (cosave)
     // ------------------------------------------------------------------
     constexpr std::uint32_t kUniqueID = 'OVG1';
     constexpr std::uint32_t kRecordClones = 'CLON';
@@ -721,7 +780,7 @@ namespace
     void SaveCallback(SKSE::SerializationInterface* intfc)
     {
         if (!intfc->OpenRecord(kRecordClones, kRecordVersion)) {
-            Log("ERRO: nao foi possivel abrir o registro do cosave.");
+            Log("ERROR: could not open the cosave record.");
             return;
         }
         const std::uint32_t count = static_cast<std::uint32_t>(g_clones.size());
@@ -744,7 +803,7 @@ namespace
             intfc->WriteRecordData(rec.armor);
             intfc->WriteRecordData(rec.armorFinal);
         }
-        Log("Cosave gravado: {} copias.", count);
+        Log("Cosave written: {} copies.", count);
     }
 
     void LoadCallback(SKSE::SerializationInterface* intfc)
@@ -775,6 +834,9 @@ namespace
                     rec.rarity.resize(len);
                     intfc->ReadRecordData(rec.rarity.data(), len);
                 }
+                if (const int idx = RarityIndexByName(rec.rarity); idx >= 0) {
+                    rec.rarity = g_cfg.rarities[idx].name;  // old saves get the current (English) name
+                }
                 if (version >= 2) {
                     std::uint8_t isArmor = 0;
                     intfc->ReadRecordData(isArmor);
@@ -785,30 +847,30 @@ namespace
 
                 RE::FormID newClone = 0, newBase = 0;
                 if (!intfc->ResolveFormID(oldClone, newClone)) {
-                    Log("  nao foi possivel resolver a copia {:08X}.", oldClone);
+                    Log("  could not resolve copy {:08X}.", oldClone);
                     continue;
                 }
                 if (!intfc->ResolveFormID(oldBase, newBase)) {
-                    Log("  nao foi possivel resolver a arma original {:08X}.", oldBase);
+                    Log("  could not resolve original item {:08X}.", oldBase);
                     continue;
                 }
                 rec.baseID = newBase;
                 g_clones[newClone] = rec;
             }
         }
-        Log("Cosave lido: {} copias.", g_clones.size());
-        RepopulateAll("carregamento do save");
+        Log("Cosave read: {} copies.", g_clones.size());
+        RepopulateAll("save load");
     }
 
     void RevertCallback(SKSE::SerializationInterface*)
     {
         g_clones.clear();
         g_built.clear();
-        Log("Revert: registro de copias limpo.");
+        Log("Revert: copy registry cleared.");
     }
 
     // ------------------------------------------------------------------
-    // Criacao de uma copia nova para um item forjado
+    // Creating a new copy for a crafted item
     // ------------------------------------------------------------------
     bool IsEligible(RE::TESBoundObject* obj)
     {
@@ -823,7 +885,7 @@ namespace
     }
 
     // ------------------------------------------------------------------
-    // Janela de resultado (caixa de mensagem do jogo)
+    // Result window (the game's message box)
     // ------------------------------------------------------------------
     std::mutex               g_pendingMutex;
     std::vector<std::string> g_pendingMessages;
@@ -834,7 +896,7 @@ namespace
         g_pendingMessages.push_back(text);
     }
 
-    // Deve rodar no fluxo principal do jogo.
+    // Must run on the game's main thread.
     void FlushResultWindow()
     {
         std::vector<std::string> msgs;
@@ -849,7 +911,7 @@ namespace
         const std::size_t maxItems = static_cast<std::size_t>(std::max(1, g_cfg.resultMaxItems));
         const std::size_t start = msgs.size() > maxItems ? msgs.size() - maxItems : 0;
         if (start > 0) {
-            all += std::format("(+{} itens anteriores)\n\n", start);
+            all += std::format("(+{} earlier items)\n\n", start);
         }
         for (std::size_t i = start; i < msgs.size(); ++i) {
             all += msgs[i];
@@ -857,31 +919,34 @@ namespace
                 all += "\n\n";
             }
         }
-        Log("Mostrando janela de resultado ({} itens).", msgs.size());
+        Log("Showing result window ({} items).", msgs.size());
         RE::DebugMessageBox(all.c_str());
     }
 
     // ------------------------------------------------------------------
-    // Receita de refino (TESTE): cria, para cada copia, uma receita de melhoria
-    // na pedra de amolar (armas) ou na mesa de armaduras.
+    // Improvement recipe: creates, for each copy, an improvement recipe
+    // at the grindstone (weapons) or the armor workbench.
     // ------------------------------------------------------------------
-    std::unordered_map<RE::FormID, RE::BGSConstructibleObject*> g_recipes;  // copia -> receita
+    std::unordered_map<RE::FormID, RE::BGSConstructibleObject*> g_recipes;  // copy -> recipe
 
     template <class C>
-    void FillRecipe(C* cobj, RE::TESForm* created, RE::BGSKeyword* bench, RE::TESBoundObject* ingredient, int count)
+    void FillRecipe(C* cobj, RE::TESForm* created, RE::BGSKeyword* bench, const std::vector<std::pair<RE::TESBoundObject*, int>>& items)
     {
-        auto** arr = static_cast<RE::ContainerObject**>(RE::malloc(sizeof(RE::ContainerObject*)));
-        auto*  entry = static_cast<RE::ContainerObject*>(RE::malloc(sizeof(RE::ContainerObject)));
-        std::memset(entry, 0, sizeof(RE::ContainerObject));
-        entry->obj = ingredient;
-        entry->count = count;
-        arr[0] = entry;
+        const std::size_t n = items.size();
+        auto**            arr = static_cast<RE::ContainerObject**>(RE::malloc(sizeof(RE::ContainerObject*) * n));
+        for (std::size_t i = 0; i < n; ++i) {
+            auto* entry = static_cast<RE::ContainerObject*>(RE::malloc(sizeof(RE::ContainerObject)));
+            std::memset(entry, 0, sizeof(RE::ContainerObject));
+            entry->obj = items[i].first;
+            entry->count = items[i].second;
+            arr[i] = entry;
+        }
         if constexpr (requires { cobj->requiredItems; }) {
             cobj->requiredItems.containerObjects = arr;
-            cobj->requiredItems.numContainerObjects = 1;
+            cobj->requiredItems.numContainerObjects = static_cast<std::uint32_t>(n);
         } else {
             cobj->containerObjects = arr;
-            cobj->numContainerObjects = 1;
+            cobj->numContainerObjects = static_cast<std::uint32_t>(n);
         }
         cobj->createdItem = created;
         cobj->benchKeyword = bench;
@@ -892,10 +957,7 @@ namespace
 
     void EnsureRefineRecipe(RE::TESBoundObject* clone, bool isArmor, int rarityIndex)
     {
-        if (!clone || !g_cfg.refineEnabled) {
-            return;
-        }
-        if (rarityIndex < g_cfg.refineMinRarity || rarityIndex > g_cfg.refineMaxRarity) {
+        if (!clone || !g_cfg.refineEnabled || rarityIndex < 0 || rarityIndex > 4) {
             return;
         }
         if (g_recipes.contains(clone->GetFormID())) {
@@ -904,31 +966,57 @@ namespace
 
         auto* dh = RE::TESDataHandler::GetSingleton();
         auto* bench = RE::TESForm::LookupByID<RE::BGSKeyword>(isArmor ? 0x000ADB78u : 0x00088108u);
-        auto* ingredient = RE::TESForm::LookupByID<RE::TESBoundObject>(g_cfg.refineItemID);
-        if (!dh || !bench || !ingredient) {
-            Log("  receita de refino NAO criada para {:08X}: dh={} bancada={} ingrediente={}",
-                clone->GetFormID(), dh != nullptr, bench != nullptr, ingredient != nullptr);
-            return;
-        }
-        auto* factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::BGSConstructibleObject>();
-        auto* cobj = factory ? factory->Create() : nullptr;
-        if (!cobj) {
-            Log("  receita de refino NAO criada: fabrica de receitas indisponivel.");
+        if (!dh || !bench) {
+            Log("  improvement recipe NOT created for {:08X}: data handler={} workbench keyword={}",
+                clone->GetFormID(), dh != nullptr, bench != nullptr);
             return;
         }
 
-        FillRecipe(cobj, clone, bench, ingredient, g_cfg.refineItemCount);
+        std::vector<std::pair<RE::TESBoundObject*, int>> items;
+        for (const auto& ing : g_cfg.recipes[rarityIndex]) {
+            auto* obj = dh->LookupForm<RE::TESBoundObject>(ing.id, ing.plugin);
+            if (!obj) {
+                Log("  recipe ingredient not found: {}|{:08X} (skipped)", ing.plugin, ing.id);
+                continue;
+            }
+            items.emplace_back(obj, ing.count);
+        }
+        if (items.empty()) {
+            Log("  improvement recipe NOT created for {:08X}: no valid ingredients for rarity {}.", clone->GetFormID(), rarityIndex + 1);
+            return;
+        }
+
+        auto* factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::BGSConstructibleObject>();
+        auto* cobj = factory ? factory->Create() : nullptr;
+        if (!cobj) {
+            Log("  improvement recipe NOT created: recipe factory unavailable.");
+            return;
+        }
+
+        FillRecipe(cobj, clone, bench, items);
         dh->GetFormArray<RE::BGSConstructibleObject>().push_back(cobj);
         g_recipes[clone->GetFormID()] = cobj;
+
+        std::string list;
+        for (auto& [obj, count] : items) {
+            list += std::format("{}{}x {}", list.empty() ? "" : ", ", count, obj->GetName());
+        }
         const char* benchId = bench->GetFormEditorID();
-        Log("  receita de refino criada {:08X} para {:08X} (bancada {}, {}x {:08X})",
-            cobj->GetFormID(), clone->GetFormID(), benchId ? benchId : "?", g_cfg.refineItemCount, g_cfg.refineItemID);
+        Log("  improvement recipe created {:08X} for {:08X} (workbench {}): {}",
+            cobj->GetFormID(), clone->GetFormID(), benchId ? benchId : "?", list);
     }
 
     int RarityIndexByName(const std::string& name)
     {
         for (int i = 0; i < 5; ++i) {
             if (g_cfg.rarities[i].name == name) {
+                return i;
+            }
+        }
+        // names used by early test versions (Portuguese): keep old saves working
+        static const char* legacy[5] = { "Comum", "Rara", "Epica", "Lendaria", "Mitica" };
+        for (int i = 0; i < 5; ++i) {
+            if (name == legacy[i]) {
                 return i;
             }
         }
@@ -947,35 +1035,38 @@ namespace
     }
 
     // ------------------------------------------------------------------
-    // Dados extras do item no inventario
+    // Extra data of an inventory item
     // ------------------------------------------------------------------
-    // Dados que a copia NAO consegue carregar: equipado, aprimorado, encantamento feito pelo jogador,
-    // nome personalizado, veneno e dono (item roubado). Qualquer outro dado extra (carga atual do
-    // encantamento, tecla de atalho, lista vazia...) pode ser perdido sem problema.
+    // Extra data that cannot survive the swap. Equipped items are always blocked; the others
+    // (improved, player-made enchantment, custom name, poison, owned/stolen) are blocked only
+    // when "BlockLossyItems" is on. Anything else (enchantment charge, hotkey...) is just lost.
     const char* BlockingExtra(RE::ExtraDataList* list)
     {
         if (!list) {
             return nullptr;
         }
         using T = RE::ExtraDataType;
-        if (list->HasType(T::kWorn) || list->HasType(T::kWornLeft)) return "equipado";
-        if (list->HasType(T::kHealth)) return "aprimorado";
-        if (list->HasType(T::kEnchantment)) return "encantamento feito pelo jogador";
-        if (list->HasType(T::kTextDisplayData)) return "nome personalizado";
-        if (list->HasType(T::kPoison)) return "envenenado";
-        if (list->HasType(T::kOwnership)) return "item com dono (roubado)";
+        if (list->HasType(T::kWorn) || list->HasType(T::kWornLeft)) return "equipped";  // always blocked
+        if (!g_cfg.blockLossyItems) {
+            return nullptr;  // everything else is allowed (extra data is lost in the swap)
+        }
+        if (list->HasType(T::kHealth)) return "improved";
+        if (list->HasType(T::kEnchantment)) return "player-made enchantment";
+        if (list->HasType(T::kTextDisplayData)) return "custom name";
+        if (list->HasType(T::kPoison)) return "poisoned";
+        if (list->HasType(T::kOwnership)) return "owned (stolen) item";
         return nullptr;
     }
 
-    // Procura uma unidade do item que possa ser trocada. outList fica nulo para uma unidade simples,
-    // ou aponta para a lista de dados extras inofensiva da unidade escolhida.
+    // Looks for a unit of the item that can be swapped. outList stays null for a plain unit,
+    // or points to the harmless extra-data list of the chosen unit.
     bool FindRemovable(RE::PlayerCharacter* player, RE::TESBoundObject* obj, RE::ExtraDataList*& outList, std::string* whyNot = nullptr)
     {
         outList = nullptr;
         auto inv = player->GetInventory([obj](RE::TESBoundObject& o) { return &o == obj; });
         auto it = inv.find(obj);
         if (it == inv.end() || it->second.first < 1) {
-            if (whyNot) *whyNot = "item nao encontrado no inventario";
+            if (whyNot) *whyNot = "item not found in the inventory";
             return false;
         }
         const int               total = it->second.first;
@@ -1001,9 +1092,9 @@ namespace
             return true;
         }
         if (total - extraTotal > 0) {
-            return true;  // unidade simples
+            return true;  // plain unit
         }
-        if (whyNot) *whyNot = blockedBy ? blockedBy : "sem unidade disponivel";
+        if (whyNot) *whyNot = blockedBy ? blockedBy : "no unit available";
         return false;
     }
 
@@ -1026,7 +1117,7 @@ namespace
         }
         if (g_forceRarity >= 1 && g_forceRarity <= 5) {
             chosen = &g_cfg.rarities[g_forceRarity - 1];
-            Log("  raridade forcada pelo menu: {}", chosen->name);
+            Log("  rarity forced from the menu: {}", chosen->name);
         }
         return chosen;
     }
@@ -1036,7 +1127,7 @@ namespace
         Log("ProcessNewItem {:08X}", itemID);
 
         if (g_clones.contains(itemID)) {
-            Log("  ja e uma copia nossa, ignorado.");
+            Log("  already one of our copies, ignored.");
             return false;
         }
 
@@ -1048,7 +1139,7 @@ namespace
         const bool okWeap = weap && g_cfg.affectWeapons && IsEligible(weap);
         const bool okArmo = armo && IsEligibleArmor(armo);
         if (!player || (!okWeap && !okArmo)) {
-            Log("  ignorado (nao e uma arma ou armadura elegivel).");
+            Log("  ignored (not an eligible weapon or armor).");
             return false;
         }
         RE::TESBoundObject* baseObj = okWeap ? static_cast<RE::TESBoundObject*>(weap) : static_cast<RE::TESBoundObject*>(armo);
@@ -1056,11 +1147,11 @@ namespace
         RE::ExtraDataList* removeList = nullptr;
         std::string        whyNot;
         if (!FindRemovable(player, baseObj, removeList, &whyNot)) {
-            Log("  nenhuma unidade trocavel: {}.", whyNot);
+            Log("  no swappable unit: {}.", whyNot);
             return false;
         }
 
-        // 1) raridade e 2) multiplicadores
+        // 1) rarity and 2) multipliers
         const RarityDef* chosen = PickRarity();
         CloneRecord      rec;
         rec.baseID = baseObj->GetFormID();
@@ -1072,26 +1163,26 @@ namespace
             rec.damage = RollRange(chosen->damage);
             rec.crit = 1.0f + RollRange(chosen->critBonus);
             rec.speed = RollRange(chosen->speed);
-            Log("  sorteio (arma): {} dano x{:.2f} valor x{:.2f} peso /{:.2f} crit x{:.2f} vel x{:.2f}",
+            Log("  roll (weapon): {} damage x{:.2f} value x{:.2f} weight /{:.2f} crit x{:.2f} speed x{:.2f}",
                 rec.rarity, rec.damage, rec.value, rec.weightDiv, rec.crit, rec.speed);
         } else {
             rec.armor = RollRange(chosen->armor);
-            Log("  sorteio (armadura): {} defesa x{:.2f} valor x{:.2f} peso /{:.2f}",
+            Log("  roll (armor): {} defense x{:.2f} value x{:.2f} weight /{:.2f}",
                 rec.rarity, rec.armor, rec.value, rec.weightDiv);
         }
 
-        // 3) criar a copia
+        // 3) create the copy
         RE::TESBoundObject* clone = nullptr;
         if (okWeap) {
             auto* factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::TESObjectWEAP>();
             auto* c = factory ? factory->Create() : nullptr;
             if (!c) {
-                Log("  FALHA: nao foi possivel criar a copia da arma.");
+                Log("  FAILURE: could not create the weapon copy.");
                 return false;
             }
-            Log("  copia criada com FormID {:08X}", c->GetFormID());
+            Log("  copy created with FormID {:08X}", c->GetFormID());
             if (!BuildClone(c, weap, rec)) {
-                Log("  FALHA ao preencher a copia.");
+                Log("  FAILURE while filling the copy.");
                 return false;
             }
             clone = c;
@@ -1099,12 +1190,12 @@ namespace
             auto* factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::TESObjectARMO>();
             auto* c = factory ? factory->Create() : nullptr;
             if (!c) {
-                Log("  FALHA: nao foi possivel criar a copia da armadura.");
+                Log("  FAILURE: could not create the armor copy.");
                 return false;
             }
-            Log("  copia criada com FormID {:08X}", c->GetFormID());
+            Log("  copy created with FormID {:08X}", c->GetFormID());
             if (!BuildArmorClone(c, armo, rec)) {
-                Log("  FALHA ao preencher a copia.");
+                Log("  FAILURE while filling the copy.");
                 return false;
             }
             clone = c;
@@ -1113,24 +1204,24 @@ namespace
         const int rarityIndex = static_cast<int>(chosen - &g_cfg.rarities[0]);
         EnsureRefineRecipe(clone, okArmo, rarityIndex);
 
-        // texto da janela de resultado
+        // result window text
         const bool showWindow = fromAppraisal ? g_cfg.appraiseWindow : (g_cfg.resultWindow && rarityIndex >= g_cfg.resultMinRarity);
         if (showWindow) {
             std::string txt = std::format("[{}] {}\n", rec.rarity, baseObj->GetName());
             if (okWeap) {
                 auto* cw = clone->As<RE::TESObjectWEAP>();
-                txt += std::format("Dano: {} para {}\n", weap->attackDamage, cw->attackDamage);
-                txt += std::format("Dano critico: {} para {}\n", weap->criticalData.damage, cw->criticalData.damage);
-                txt += std::format("Velocidade: {:.2f} para {:.2f}\n", weap->weaponData.speed, cw->weaponData.speed);
-                txt += std::format("Peso: {:.1f} para {:.1f}\n", weap->weight, cw->weight);
-                txt += std::format("Valor: {} para {}", weap->value, cw->value);
+                txt += std::format("Damage: {} to {}\n", weap->attackDamage, cw->attackDamage);
+                txt += std::format("Critical damage: {} to {}\n", weap->criticalData.damage, cw->criticalData.damage);
+                txt += std::format("Speed: {:.2f} to {:.2f}\n", weap->weaponData.speed, cw->weaponData.speed);
+                txt += std::format("Weight: {:.1f} to {:.1f}\n", weap->weight, cw->weight);
+                txt += std::format("Value: {} to {}", weap->value, cw->value);
             } else {
                 auto*       ca = clone->As<RE::TESObjectARMO>();
                 const bool  limited = ca->armorRating < static_cast<std::uint32_t>(std::lround(static_cast<float>(armo->armorRating) * rec.armor));
-                txt += std::format("Defesa: {:.1f} para {:.1f}{}\n", static_cast<float>(armo->armorRating) / kRatingScale,
-                                   static_cast<float>(ca->armorRating) / kRatingScale, limited ? " (limite)" : "");
-                txt += std::format("Peso: {:.1f} para {:.1f}\n", armo->weight, ca->weight);
-                txt += std::format("Valor: {} para {}", armo->value, ca->value);
+                txt += std::format("Defense: {:.1f} to {:.1f}{}\n", static_cast<float>(armo->armorRating) / kRatingScale,
+                                   static_cast<float>(ca->armorRating) / kRatingScale, limited ? " (capped)" : "");
+                txt += std::format("Weight: {:.1f} to {:.1f}\n", armo->weight, ca->weight);
+                txt += std::format("Value: {} to {}", armo->value, ca->value);
             }
             QueueResultWindow(txt);
         }
@@ -1138,21 +1229,21 @@ namespace
         {
             std::lock_guard<std::mutex> lock(g_summaryMutex);
             if (okWeap) {
-                g_lastSummary = std::format("[{}] {} | dano x{:.2f}  valor x{:.2f}  peso /{:.2f}  critico x{:.2f}  velocidade x{:.2f}",
+                g_lastSummary = std::format("[{}] {} | damage x{:.2f}  value x{:.2f}  weight /{:.2f}  critical x{:.2f}  speed x{:.2f}",
                                             rec.rarity, baseObj->GetName(), rec.damage, rec.value, rec.weightDiv, rec.crit, rec.speed);
             } else {
-                g_lastSummary = std::format("[{}] {} ({}) | defesa x{:.2f} -> {:.1f} (base {:.1f})  valor x{:.2f}  peso /{:.2f}",
+                g_lastSummary = std::format("[{}] {} ({}) | defense x{:.2f} -> {:.1f} (base {:.1f})  value x{:.2f}  weight /{:.2f}",
                                             rec.rarity, baseObj->GetName(), CatName(Categorize(armo)), rec.armor,
                                             static_cast<float>(rec.armorFinal) / kRatingScale,
                                             static_cast<float>(armo->armorRating) / kRatingScale, rec.value, rec.weightDiv);
             }
         }
 
-        // 4) trocar no inventario
+        // 4) swap in the inventory
         player->RemoveItem(baseObj, 1, RE::ITEM_REMOVE_REASON::kRemove, removeList, nullptr);
-        Log("  item original removido{}", removeList ? " (unidade com dados extras inofensivos)" : "");
+        Log("  original item removed{}", removeList ? " (unit with harmless extra data)" : "");
         player->AddObjectToContainer(clone, nullptr, 1, nullptr);
-        Log("  copia adicionada ao inventario");
+        Log("  copy added to the inventory");
 
         if (g_cfg.notify) {
             const std::string msg = std::format("{}: {}", rec.rarity, baseObj->GetName());
@@ -1161,31 +1252,31 @@ namespace
         if (!g_craftingMenuOpen) {
             FlushResultWindow();
         }
-        Log("  concluido");
+        Log("  done");
         return true;
     }
 
     // ------------------------------------------------------------------
-    // Eventos do jogo
+    // Game events
     // ------------------------------------------------------------------
     bool g_busy = false;
     std::chrono::steady_clock::time_point g_cooldownUntil{};
 
     // ------------------------------------------------------------------
-    // Avaliador: sorteia a raridade de um item que o jogador ja tem.
-    // Fluxo: tecla no inventario -> o inventario e fechado -> o item e trocado -> janela de resultado.
-    // (A lista do inventario nao se atualiza com o menu aberto, por isso a troca so acontece depois de fechar.)
+    // Appraiser: rolls the rarity of an item the player already owns.
+    // Flow: key in the inventory -> the inventory is closed -> the item is swapped -> result window.
+    // (The inventory list does not refresh while the menu is open, so the swap only happens after it closes.)
     // ------------------------------------------------------------------
     RE::FormID                            g_pendingAppraisal = 0;
     std::chrono::steady_clock::time_point g_pendingSince{};
 
     void Toast(const char* msg)
     {
-        Log("Aviso ao jogador: {}", msg);
+        Log("Player notice: {}", msg);
         RE::DebugNotification(msg);
     }
 
-    // FormID do item selecionado no inventario (le a lista da interface; funciona com SkyUI)
+    // FormID of the item selected in the inventory (reads the UI list; works with SkyUI)
     RE::FormID SelectedInventoryFormID()
     {
         auto* ui = RE::UI::GetSingleton();
@@ -1194,38 +1285,38 @@ namespace
         }
         auto movie = ui->GetMovieView(RE::InventoryMenu::MENU_NAME);
         if (!movie) {
-            Log("Avaliador: interface do inventario indisponivel.");
+            Log("Appraiser: inventory interface unavailable.");
             return 0;
         }
         RE::GFxValue entry;
         if (!movie->GetVariable(&entry, "_root.Menu_mc.inventoryLists.itemList.selectedEntry") || !entry.IsObject()) {
-            Log("Avaliador: nao encontrei o item selecionado na lista do inventario.");
+            Log("Appraiser: could not find the selected item in the inventory list.");
             return 0;
         }
         RE::GFxValue fid;
         if (!entry.GetMember("formId", &fid) || !fid.IsNumber()) {
-            Log("Avaliador: o item selecionado nao informa o formId.");
+            Log("Appraiser: the selected item does not report a formId.");
             return 0;
         }
         const auto n = static_cast<std::int64_t>(fid.GetNumber());
         return static_cast<RE::FormID>(static_cast<std::uint32_t>(n));
     }
 
-    // 1) tecla apertada com o inventario aberto: valida e pede para fechar o inventario
+    // 1) key pressed with the inventory open: validate and ask to close the inventory
     void RequestAppraisal()
     {
-        Log("Avaliador: tecla pressionada no inventario.");
+        Log("Appraiser: key pressed in the inventory.");
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (!player || g_pendingAppraisal != 0) {
             return;
         }
         const RE::FormID id = SelectedInventoryFormID();
         if (id == 0) {
-            Toast("Nao consegui ler o item selecionado.");
+            Toast("Could not read the selected item.");
             return;
         }
         if (g_clones.contains(id)) {
-            Toast("Este item ja tem raridade.");
+            Toast("This item already has a rarity.");
             return;
         }
         auto* form = RE::TESForm::LookupByID(id);
@@ -1233,37 +1324,37 @@ namespace
         const bool isWeapon = obj && obj->As<RE::TESObjectWEAP>();
         const bool isArmor = obj && obj->As<RE::TESObjectARMO>();
         if (!isWeapon && !isArmor) {
-            Toast("So armas e armaduras podem ser avaliadas.");
+            Toast("Only weapons and armor can be appraised.");
             return;
         }
         {
             RE::ExtraDataList* l = nullptr;
             std::string        why;
             if (!FindRemovable(player, obj, l, &why)) {
-                Log("Avaliador: item {:08X} recusado: {}.", id, why);
-                Toast("Este item nao pode ser avaliado agora (equipado, aprimorado, roubado ou com encantamento seu).");
+                Log("Appraiser: item {:08X} refused: {}.", id, why);
+                Toast("This item cannot be appraised right now (it is equipped, or blocked by your settings).");
                 return;
             }
         }
 
         g_pendingAppraisal = id;
         g_pendingSince = std::chrono::steady_clock::now();
-        Log("Avaliador: item {:08X} aceito; fechando o inventario para trocar o item.", id);
+        Log("Appraiser: item {:08X} accepted; closing the inventory to swap the item.", id);
         if (auto* q = RE::UIMessageQueue::GetSingleton()) {
             q->AddMessage(RE::InventoryMenu::MENU_NAME, RE::UI_MESSAGE_TYPE::kHide, nullptr);
         }
     }
 
-    // 2) o inventario fechou: troca o item e mostra a janela de resultado
+    // 2) the inventory closed: swap the item and show the result window
     void RunAppraisal(RE::FormID id)
     {
-        Log("Avaliador: inventario fechado, avaliando {:08X}.", id);
+        Log("Appraiser: inventory closed, appraising {:08X}.", id);
         g_busy = true;
         const bool ok = ProcessNewItem(id, true);
         g_busy = false;
         g_cooldownUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
         if (!ok) {
-            Toast("Este item nao pode receber raridade (veja as opcoes no menu).");
+            Toast("This item cannot receive a rarity (check the options in the menu).");
         }
     }
 
@@ -1302,10 +1393,10 @@ namespace
     };
 
     // ------------------------------------------------------------------
-    // Devolver os itens originais (para desinstalar o mod com seguranca)
+    // Return the original items (to uninstall the mod safely)
     // ------------------------------------------------------------------
     bool        g_revertArmed = false;
-    std::string g_revertStatus;  // protegida por g_summaryMutex
+    std::string g_revertStatus;  // protected by g_summaryMutex
 
     void RevertAllInInventory()
     {
@@ -1313,7 +1404,7 @@ namespace
         if (!player) {
             return;
         }
-        Log("Devolucao: iniciando.");
+        Log("Return: starting.");
         auto inv = player->GetInventory([](RE::TESBoundObject& o) { return g_clones.contains(o.GetFormID()); });
         std::vector<std::pair<RE::TESBoundObject*, int>> work;
         for (auto& [obj, data] : inv) {
@@ -1326,7 +1417,7 @@ namespace
             auto  rec = g_clones.find(obj->GetFormID());
             auto* base = rec != g_clones.end() ? RE::TESForm::LookupByID<RE::TESBoundObject>(rec->second.baseID) : nullptr;
             if (!base) {
-                Log("  item {:08X}: o original nao foi encontrado (mod do item removido?). Mantido.", obj->GetFormID());
+                Log("  item {:08X}: the original was not found (the item's mod removed?). Kept.", obj->GetFormID());
                 ++missing;
                 continue;
             }
@@ -1339,9 +1430,9 @@ namespace
         g_busy = false;
         g_cooldownUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
 
-        const std::string msg = std::format("Devolvidos {} itens ({} tipos).{}", units, kinds,
-                                            missing > 0 ? std::format(" {} nao puderam ser devolvidos (veja o log).", missing) : "");
-        Log("Devolucao concluida: {}", msg);
+        const std::string msg = std::format("Returned {} items ({} kinds).{}", units, kinds,
+                                            missing > 0 ? std::format(" {} could not be returned (see the log).", missing) : "");
+        Log("Return finished: {}", msg);
         {
             std::lock_guard<std::mutex> lock(g_summaryMutex);
             g_revertStatus = msg;
@@ -1374,7 +1465,7 @@ namespace
                 if (waited < std::chrono::seconds(5)) {
                     SKSE::GetTaskInterface()->AddTask([id]() { RunAppraisal(id); });
                 } else {
-                    Log("Avaliador: pedido expirado, ignorado.");
+                    Log("Appraiser: request expired, ignored.");
                 }
             }
             return RE::BSEventNotifyControl::kContinue;
@@ -1406,14 +1497,14 @@ namespace
             const RE::FormID base = a_event->baseObj;
             const int        count = std::max<int>(1, a_event->itemCount);
 
-            // so nos interessam armas e armaduras
+            // we only care about weapons and armor
             auto*      form = RE::TESForm::LookupByID(base);
             const bool isWeapon = form && form->As<RE::TESObjectWEAP>() && g_cfg.affectWeapons;
             const bool isArmor = form && form->As<RE::TESObjectARMO>() && g_cfg.affectArmor;
             if (!isWeapon && !isArmor) {
                 return RE::BSEventNotifyControl::kContinue;
             }
-            Log("Evento: {} {:08X} x{} entrou no inventario durante a forja", isArmor ? "armadura" : "arma", base, count);
+            Log("Event: {} {:08X} x{} entered the inventory while crafting", isArmor ? "armor" : "weapon", base, count);
 
             SKSE::GetTaskInterface()->AddTask([base, count]() {
                 g_busy = true;
@@ -1428,17 +1519,17 @@ namespace
     };
 
     // ------------------------------------------------------------------
-    // Menu no SKSE Menu Framework
+    // Menu in the SKSE Menu Framework
     // ------------------------------------------------------------------
     std::string g_menuStatus;
 
-    // dois sliders (minimo e maximo) que nunca se cruzam
+    // two sliders (minimum and maximum) that never cross
     void RangeSliders(const char* name, Range& r, float lo, float hi)
     {
         ImGuiMCP::PushID(name);
         ImGuiMCP::Text("%s", name);
-        const bool a = ImGuiMCP::SliderFloat("minimo", &r.min, lo, hi, "%.2f", 0);
-        const bool b = ImGuiMCP::SliderFloat("maximo", &r.max, lo, hi, "%.2f", 0);
+        const bool a = ImGuiMCP::SliderFloat("minimum", &r.min, lo, hi, "%.2f", 0);
+        const bool b = ImGuiMCP::SliderFloat("maximum", &r.max, lo, hi, "%.2f", 0);
         if (a && r.min > r.max) {
             r.max = r.min;
         }
@@ -1449,7 +1540,7 @@ namespace
         ImGuiMCP::PopID();
     }
 
-    // slider com o titulo em cima, como os de minimo/maximo
+    // slider with its title on top, like the minimum/maximum ones
     void TitledSlider(const char* title, float* v, float lo, float hi, const char* fmt)
     {
         ImGuiMCP::PushID(title);
@@ -1461,29 +1552,29 @@ namespace
 
     void __stdcall RenderMenu()
     {
-        ImGuiMCP::Text("Overgeared - raridade de armas forjadas");
-        ImGuiMCP::TextWrapped("As mudancas valem para as PROXIMAS armas forjadas. Armas que ja existem nao mudam.");
+        ImGuiMCP::Text("Overgeared - rarity for crafted gear");
+        ImGuiMCP::TextWrapped("Changes apply to the NEXT items you craft or appraise. Items that already exist do not change.");
         ImGuiMCP::Separator();
 
-        ImGuiMCP::Checkbox("So afeta itens forjados", &g_cfg.onlyWhenCrafting);
-        ImGuiMCP::Checkbox("Mostrar notificacao ao forjar", &g_cfg.notify);
-        ImGuiMCP::Checkbox("Afetar armas", &g_cfg.affectWeapons);
-        ImGuiMCP::Checkbox("Afetar armaduras", &g_cfg.affectArmor);
-        ImGuiMCP::Checkbox("Afetar roupas", &g_cfg.affectClothing);
-        ImGuiMCP::Checkbox("Afetar joias e acessorios", &g_cfg.affectJewelry);
+        ImGuiMCP::Checkbox("Only affect crafted items", &g_cfg.onlyWhenCrafting);
+        ImGuiMCP::Checkbox("Show a notification when crafting", &g_cfg.notify);
+        ImGuiMCP::Checkbox("Affect weapons", &g_cfg.affectWeapons);
+        ImGuiMCP::Checkbox("Affect armor", &g_cfg.affectArmor);
+        ImGuiMCP::Checkbox("Affect clothing", &g_cfg.affectClothing);
+        ImGuiMCP::Checkbox("Affect jewelry and accessories", &g_cfg.affectJewelry);
         ImGuiMCP::Spacing();
-        ImGuiMCP::Checkbox("Janela de resultado ao FORJAR", &g_cfg.resultWindow);
-        ImGuiMCP::Text("Na forja, mostrar a janela a partir da raridade:");
-        ImGuiMCP::Combo("##janelamin", &g_cfg.resultMinRarity, "Comum\0Rara\0Epica\0Lendaria\0Mitica\0");
-        ImGuiMCP::SliderInt("Itens por janela", &g_cfg.resultMaxItems, 1, 5, "%d", 0);
-        ImGuiMCP::TextWrapped("Os numeros da janela sao os valores BASE do item. No inventario o jogo soma o bonus de habilidades e perks.");
+        ImGuiMCP::Checkbox("Result window when CRAFTING", &g_cfg.resultWindow);
+        ImGuiMCP::Text("When crafting, show the window from this rarity up:");
+        ImGuiMCP::Combo("##windowmin", &g_cfg.resultMinRarity, "Common\0Rare\0Epic\0Legendary\0Mythic\0");
+        ImGuiMCP::SliderInt("Items per window", &g_cfg.resultMaxItems, 1, 5, "%d", 0);
+        ImGuiMCP::TextWrapped("The numbers in the window are the item\'s BASE values. In the inventory the game adds the bonus from skills and perks.");
 
         ImGuiMCP::Spacing();
-        ImGuiMCP::Text("Forcar raridade (para testes):");
-        ImGuiMCP::Combo("##forcar", &g_forceRarity, "Aleatoria\0Comum\0Rara\0Epica\0Lendaria\0Mitica\0");
+        ImGuiMCP::Text("Force rarity (for testing):");
+        ImGuiMCP::Combo("##force", &g_forceRarity, "Random\0Common\0Rare\0Epic\0Legendary\0Mythic\0");
 
         ImGuiMCP::Spacing();
-        ImGuiMCP::Text("Ultima arma forjada:");
+        ImGuiMCP::Text("Last item crafted:");
         {
             std::string copy;
             {
@@ -1494,52 +1585,53 @@ namespace
         }
 
         ImGuiMCP::Separator();
-        if (ImGuiMCP::Button("Salvar no .ini")) {
-            g_menuStatus = SaveConfig() ? "Salvo em Data/SKSE/Plugins/Overgeared.ini" : "ERRO ao salvar (veja o log)";
+        if (ImGuiMCP::Button("Save to .ini")) {
+            g_menuStatus = SaveConfig() ? "Saved to Data/SKSE/Plugins/Overgeared.ini" : "ERROR while saving (see the log)";
         }
         ImGuiMCP::SameLine();
-        if (ImGuiMCP::Button("Recarregar do .ini")) {
+        if (ImGuiMCP::Button("Reload from .ini")) {
             LoadConfig();
-            g_menuStatus = "Recarregado do .ini";
+            g_menuStatus = "Reloaded from .ini";
         }
         ImGuiMCP::SameLine();
-        if (ImGuiMCP::Button("Valores padrao")) {
+        if (ImGuiMCP::Button("Reset to defaults")) {
             g_cfg = Config{};
-            g_menuStatus = "Valores padrao restaurados (ainda nao salvos)";
+            g_menuStatus = "Defaults restored (not saved yet)";
         }
         if (!g_menuStatus.empty()) {
             ImGuiMCP::TextWrapped("%s", g_menuStatus.c_str());
         }
         ImGuiMCP::Separator();
 
-        if (ImGuiMCP::CollapsingHeader("Avaliador")) {
-            ImGuiMCP::TextWrapped("Com o inventario aberto, selecione uma arma ou armadura que voce ja tem e aperte a tecla de avaliar. "
-                                  "O inventario fecha, o item e trocado por uma versao com raridade, e a janela de resultado aparece.");
-            ImGuiMCP::Checkbox("Ativar o avaliador", &g_cfg.appraiseEnabled);
-            ImGuiMCP::Checkbox("Janela de resultado ao AVALIAR (sempre aparece, de qualquer raridade)", &g_cfg.appraiseWindow);
-            ImGuiMCP::TextWrapped("Tecla: codigo %d (AppraiseKey no .ini; 24 = O, 25 = P, 0 desliga). "
-                                  "Digitar essa letra na busca do inventario tambem aciona.", g_cfg.appraiseKey);
-            ImGuiMCP::TextWrapped("Nao avalia: itens que ja tem raridade, equipados, aprimorados, roubados, com nome personalizado ou com encantamento feito por voce. Encantamentos que ja vem no item (de mod ou do jogo) sao mantidos.");
+        if (ImGuiMCP::CollapsingHeader("Appraiser")) {
+            ImGuiMCP::TextWrapped("With the inventory open, select a weapon or armor you already own and press the appraise key. "
+                                  "The inventory closes, the item is swapped for a version with a rarity, and the result window appears.");
+            ImGuiMCP::Checkbox("Enable the appraiser", &g_cfg.appraiseEnabled);
+            ImGuiMCP::Checkbox("Result window when APPRAISING (always shown, any rarity)", &g_cfg.appraiseWindow);
+            ImGuiMCP::TextWrapped("Key: code %d (AppraiseKey in the .ini; 24 = O, 25 = P, 0 disables). "
+                                  "Typing that letter in the inventory search box also triggers it.", g_cfg.appraiseKey);
+            ImGuiMCP::Checkbox("Block items that would lose data (improved, stolen, enchanted by you, renamed)", &g_cfg.blockLossyItems);
+            ImGuiMCP::TextWrapped("Never appraises: items that already have a rarity, or equipped items. With the option above off, improved, stolen, renamed or player-enchanted items are appraised and lose that data. Enchantments that come with the item (from the game or a mod) are kept.");
         }
         ImGuiMCP::Separator();
 
-        if (ImGuiMCP::CollapsingHeader("Desinstalar: devolver os itens originais")) {
-            ImGuiMCP::TextWrapped("Os itens com raridade ficam gravados no seu save e dependem deste mod. Antes de desinstalar, "
-                                  "devolva os originais. Isto troca cada item com raridade do SEU INVENTARIO pelo item original.");
-            ImGuiMCP::TextWrapped("Itens no chao, em baus ou com seguidores precisam ser recolhidos antes. "
-                                  "Melhorias e encantamentos feitos por voce nos itens com raridade sao PERDIDOS. Desequipe tudo antes.");
+        if (ImGuiMCP::CollapsingHeader("Uninstalling: return the original items")) {
+            ImGuiMCP::TextWrapped("Items with a rarity are stored in your save and depend on this mod. Before uninstalling, "
+                                  "return the originals. This swaps every rarity item in YOUR INVENTORY back to the original item.");
+            ImGuiMCP::TextWrapped("Items on the ground, in chests or with followers must be picked up first. "
+                                  "Improvements and enchantments you made on rarity items are LOST. Unequip everything first.");
             if (!g_revertArmed) {
-                if (ImGuiMCP::Button("Preparar devolucao")) {
+                if (ImGuiMCP::Button("Prepare return")) {
                     g_revertArmed = true;
                 }
             } else {
-                ImGuiMCP::TextWrapped("Tem certeza? Esta acao nao pode ser desfeita.");
-                if (ImGuiMCP::Button("CONFIRMAR: devolver os originais")) {
+                ImGuiMCP::TextWrapped("Are you sure? This cannot be undone.");
+                if (ImGuiMCP::Button("CONFIRM: return the originals")) {
                     g_revertArmed = false;
                     SKSE::GetTaskInterface()->AddTask([]() { RevertAllInInventory(); });
                 }
                 ImGuiMCP::SameLine();
-                if (ImGuiMCP::Button("Cancelar")) {
+                if (ImGuiMCP::Button("Cancel")) {
                     g_revertArmed = false;
                 }
             }
@@ -1554,31 +1646,18 @@ namespace
         }
         ImGuiMCP::Separator();
 
-        if (ImGuiMCP::CollapsingHeader("Refino (teste)")) {
-            ImGuiMCP::TextWrapped("Cria uma receita para melhorar o item na pedra de amolar (armas) ou na mesa de armaduras. "
-                                  "Vale para itens criados DEPOIS de ligar e, ao carregar o jogo, para os existentes.");
-            ImGuiMCP::Checkbox("Criar receita de refino", &g_cfg.refineEnabled);
-            ImGuiMCP::Text("Da raridade:");
-            ImGuiMCP::Combo("##refmin", &g_cfg.refineMinRarity, "Comum\0Rara\0Epica\0Lendaria\0Mitica\0");
-            ImGuiMCP::Text("Ate a raridade:");
-            ImGuiMCP::Combo("##refmax", &g_cfg.refineMaxRarity, "Comum\0Rara\0Epica\0Lendaria\0Mitica\0");
-            ImGuiMCP::TextWrapped("Ingrediente exigido: %08X x%d (troque no .ini: RefineItemID e RefineItemCount)",
-                                  g_cfg.refineItemID, g_cfg.refineItemCount);
-        }
-        ImGuiMCP::Separator();
-
-        if (ImGuiMCP::CollapsingHeader("Armaduras: limites de defesa")) {
-            ImGuiMCP::TextWrapped("Bonus maximo de defesa em relacao a base (0 = sem limite). Vale para todas as pecas.");
-            ImGuiMCP::SliderFloat("Bonus maximo (x a base)", &g_cfg.armorMaxMult, 0.0f, 5.0f, "%.2f", 0);
+        if (ImGuiMCP::CollapsingHeader("Armor: defense limits")) {
+            ImGuiMCP::TextWrapped("Maximum defense bonus relative to the base (0 = no limit). Applies to every piece.");
+            ImGuiMCP::SliderFloat("Maximum bonus (x base)", &g_cfg.armorMaxMult, 0.0f, 5.0f, "%.2f", 0);
             ImGuiMCP::Spacing();
-            ImGuiMCP::TextWrapped("Teto de defesa por tipo de peca (valor exibido no inventario; 0 = sem teto). "
-                                  "O teto nunca reduz uma peca abaixo da defesa que ela ja tinha.");
-            ImGuiMCP::SliderFloat("Teto: peitoral", &g_cfg.capBody, 0.0f, 700.0f, "%.0f", 0);
-            ImGuiMCP::SliderFloat("Teto: cabeca", &g_cfg.capHead, 0.0f, 700.0f, "%.0f", 0);
-            ImGuiMCP::SliderFloat("Teto: maos", &g_cfg.capHands, 0.0f, 700.0f, "%.0f", 0);
-            ImGuiMCP::SliderFloat("Teto: pes", &g_cfg.capFeet, 0.0f, 700.0f, "%.0f", 0);
-            ImGuiMCP::SliderFloat("Teto: escudo", &g_cfg.capShield, 0.0f, 700.0f, "%.0f", 0);
-            ImGuiMCP::SliderFloat("Teto: outras pecas", &g_cfg.capOther, 0.0f, 700.0f, "%.0f", 0);
+            ImGuiMCP::TextWrapped("Defense cap per piece type (value shown in the inventory; 0 = no cap). "
+                                  "The cap never lowers a piece below the defense it already had.");
+            ImGuiMCP::SliderFloat("Cap: chest", &g_cfg.capBody, 0.0f, 700.0f, "%.0f", 0);
+            ImGuiMCP::SliderFloat("Cap: head", &g_cfg.capHead, 0.0f, 700.0f, "%.0f", 0);
+            ImGuiMCP::SliderFloat("Cap: hands", &g_cfg.capHands, 0.0f, 700.0f, "%.0f", 0);
+            ImGuiMCP::SliderFloat("Cap: feet", &g_cfg.capFeet, 0.0f, 700.0f, "%.0f", 0);
+            ImGuiMCP::SliderFloat("Cap: shield", &g_cfg.capShield, 0.0f, 700.0f, "%.0f", 0);
+            ImGuiMCP::SliderFloat("Cap: other pieces", &g_cfg.capOther, 0.0f, 700.0f, "%.0f", 0);
         }
         ImGuiMCP::Separator();
 
@@ -1586,13 +1665,13 @@ namespace
             auto& r = g_cfg.rarities[i];
             ImGuiMCP::PushID(i);
             if (ImGuiMCP::CollapsingHeader(r.name.c_str())) {
-                TitledSlider("Chance (peso relativo)", &r.chance, 0.0f, 100.0f, "%.1f");
-                RangeSliders("Dano (multiplicador)", r.damage, 0.5f, 8.0f);
-                RangeSliders("Valor de venda (multiplicador)", r.value, 0.5f, 8.0f);
-                TitledSlider("Peso (divisor fixo: 2 = metade do peso)", &r.weightDiv, 0.5f, 6.0f, "%.2f");
-                RangeSliders("Velocidade de ataque (multiplicador)", r.speed, 0.1f, 5.0f);
-                RangeSliders("Dano critico: bonus somado", r.critBonus, 0.0f, 6.0f);
-                RangeSliders("Defesa de armadura (multiplicador)", r.armor, 0.5f, 5.0f);
+                TitledSlider("Chance (relative weight)", &r.chance, 0.0f, 100.0f, "%.1f");
+                RangeSliders("Damage (multiplier)", r.damage, 0.5f, 8.0f);
+                RangeSliders("Sell value (multiplier)", r.value, 0.5f, 8.0f);
+                TitledSlider("Weight (fixed divisor: 2 = half the weight)", &r.weightDiv, 0.5f, 6.0f, "%.2f");
+                RangeSliders("Attack speed (multiplier)", r.speed, 0.1f, 5.0f);
+                RangeSliders("Critical damage: added bonus", r.critBonus, 0.0f, 6.0f);
+                RangeSliders("Armor defense (multiplier)", r.armor, 0.5f, 5.0f);
             }
             ImGuiMCP::PopID();
         }
@@ -1601,12 +1680,12 @@ namespace
     void RegisterMenu()
     {
         if (!SKSEMenuFramework::IsInstalled()) {
-            Log("SKSE Menu Framework nao encontrado: o menu do Overgeared fica desativado.");
+            Log("SKSE Menu Framework not found: the Overgeared menu is disabled.");
             return;
         }
         SKSEMenuFramework::SetSection("Overgeared");
-        SKSEMenuFramework::AddSectionItem("Raridades", RenderMenu);
-        Log("Menu registrado no SKSE Menu Framework.");
+        SKSEMenuFramework::AddSectionItem("Rarities", RenderMenu);
+        Log("Menu registered in the SKSE Menu Framework.");
     }
 
     void OnMessage(SKSE::MessagingInterface::Message* msg)
@@ -1625,12 +1704,12 @@ namespace
             if (auto* input = RE::BSInputDeviceManager::GetSingleton()) {
                 input->AddEventSink(InputSink::Get());
             }
-            Log("Eventos registrados.");
+            Log("Events registered.");
             break;
         case SKSE::MessagingInterface::kPostLoadGame:
-            RepopulateAll("apos carregar o jogo");
+            RepopulateAll("after loading the game");
             EnsureAllRecipes();
-            RE::DebugNotification("Overgeared v3 (prototipo) ativo");
+            RE::DebugNotification("Overgeared active");
             break;
         default:
             break;
