@@ -955,6 +955,21 @@ namespace
         }
     }
 
+    // Finds a recipe ingredient. Skyrim.esm is always load-order index 0, so its FormIDs are used as they are.
+    // Other plugins are looked up by name (this depends on the game's plugin list being readable).
+    RE::TESBoundObject* FindIngredient(RE::TESDataHandler* dh, const Ingredient& ing)
+    {
+        if (_stricmp(ing.plugin.c_str(), "Skyrim.esm") == 0) {
+            return RE::TESForm::LookupByID<RE::TESBoundObject>(ing.id);
+        }
+        auto* obj = dh ? dh->LookupForm<RE::TESBoundObject>(ing.id, ing.plugin) : nullptr;
+        if (!obj && dh) {
+            Log("  lookup by plugin name failed for {}|{:08X} (plugin {})", ing.plugin, ing.id,
+                dh->LookupModByName(ing.plugin) ? "is loaded" : "was NOT found in the load order");
+        }
+        return obj;
+    }
+
     void EnsureRefineRecipe(RE::TESBoundObject* clone, bool isArmor, int rarityIndex)
     {
         if (!clone || !g_cfg.refineEnabled || rarityIndex < 0 || rarityIndex > 4) {
@@ -974,7 +989,7 @@ namespace
 
         std::vector<std::pair<RE::TESBoundObject*, int>> items;
         for (const auto& ing : g_cfg.recipes[rarityIndex]) {
-            auto* obj = dh->LookupForm<RE::TESBoundObject>(ing.id, ing.plugin);
+            auto* obj = FindIngredient(dh, ing);
             if (!obj) {
                 Log("  recipe ingredient not found: {}|{:08X} (skipped)", ing.plugin, ing.id);
                 continue;
