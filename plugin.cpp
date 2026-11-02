@@ -162,9 +162,16 @@ namespace
         bool                                  refineEnabled = true;
         std::array<std::vector<Ingredient>, 5> recipes = DefaultRecipes();
 
-        // Appraiser: block items that would lose data when swapped (upgraded, stolen, player-enchanted, renamed, poisoned).
-        // Equipped items are always blocked.
-        bool blockLossyItems = false;
+        // Appraiser: items that are always refused: equipped items and quest items.
+        // blockLossyItems: also refuse stolen, renamed and player-enchanted items (that data would be lost in the swap).
+        // blockImprovedItems: also refuse improved (tempered) and poisoned items.
+        // Enchantments that come with the item (from the game or a mod) are never a problem.
+        bool blockLossyItems = true;
+        bool blockImprovedItems = false;
+
+        // Items that must never receive a rarity (same format as the recipes: [plugin|]hexFormID).
+        // Quest-tracked items are blocked automatically, this list is for anything else (e.g. scripted artifacts).
+        std::vector<Ingredient> blacklist;
 
         // Armor: defense limits
         float armorMaxMult = 2.0f;  // maximum bonus relative to base defense (0 = no limit)
@@ -281,8 +288,12 @@ namespace
                     g_cfg.appraiseKey = std::stoi(val);
                 } else if (key == "RefineEnabled") {
                     g_cfg.refineEnabled = ToBool(val);
+                } else if (key == "Blacklist") {
+                    g_cfg.blacklist = ParseRecipe(val);
                 } else if (key == "BlockLossyItems") {
                     g_cfg.blockLossyItems = ToBool(val);
+                } else if (key == "BlockImprovedItems") {
+                    g_cfg.blockImprovedItems = ToBool(val);
                 } else if (key.rfind("RefineRecipe", 0) == 0 && key.size() == 13 && key[12] >= '1' && key[12] <= '5') {
                     g_cfg.recipes[key[12] - '1'] = ParseRecipe(val);
                 } else if (key == "AffectClothing") {
@@ -352,7 +363,9 @@ namespace
         for (int i = 0; i < 5; ++i) {
             f << std::format("RefineRecipe{}={}\n", i + 1, FormatRecipe(g_cfg.recipes[i]));
         }
-        f << std::format("BlockLossyItems={}\n", g_cfg.blockLossyItems ? 1 : 0);
+        f << std::format("BlockLossyItems={}\nBlockImprovedItems={}\n", g_cfg.blockLossyItems ? 1 : 0, g_cfg.blockImprovedItems ? 1 : 0);
+        f << "; Blacklist: items that never get a rarity. Format [plugin|]hexFormID, comma separated.\n";
+        f << std::format("Blacklist={}\n", FormatRecipe(g_cfg.blacklist));
         f << "; Armor: ArmorMaxMultiplier = maximum defense bonus vs the base (0 = no limit)\n";
         f << "; Cap* = displayed defense cap per piece type (0 = no cap)\n";
         f << std::format("ArmorMaxMultiplier={:.2f}\n", g_cfg.armorMaxMult);
@@ -970,6 +983,20 @@ namespace
         return obj;
     }
 
+    bool IsBlacklisted(RE::TESForm* form)
+    {
+        if (!form || g_cfg.blacklist.empty()) {
+            return false;
+        }
+        auto* dh = RE::TESDataHandler::GetSingleton();
+        for (const auto& ing : g_cfg.blacklist) {
+            if (FindIngredient(dh, ing) == form) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     void EnsureRefineRecipe(RE::TESBoundObject* clone, bool isArmor, int rarityIndex)
     {
         if (!clone || !g_cfg.refineEnabled || rarityIndex < 0 || rarityIndex > 4) {
@@ -1061,16 +1088,32 @@ namespace
             return nullptr;
         }
         using T = RE::ExtraDataType;
-        if (list->HasType(T::kWorn) || list->HasType(T::kWornLeft)) return "equipped";  // always blocked
-        if (!g_cfg.blockLossyItems) {
-            return nullptr;  // everything else is allowed (extra data is lost in the swap)
+        // always refused
+        if (list->HasType(T::kWorn) || list->HasType(T::kWornLeft)) return "equipped";
+        if (list->HasType(T::kAliasInstanceArray)) return "quest item";  // a quest tracks this exact item
+        // refused by default (data that would be lost in the swap)
+        if (g_cfg.blockLossyItems) {
+            if (list->HasType(T::kOwnership)) return "owned (stolen) item";
+            if (list->HasType(T::kTextDisplayData)) return "custom name";
+            if (list->HasType(T::kEnchantment)) return "player-made enchantment";
         }
-        if (list->HasType(T::kHealth)) return "improved";
-        if (list->HasType(T::kEnchantment)) return "player-made enchantment";
-        if (list->HasType(T::kTextDisplayData)) return "custom name";
-        if (list->HasType(T::kPoison)) return "poisoned";
-        if (list->HasType(T::kOwnership)) return "owned (stolen) item";
+        // allowed by default
+        if (g_cfg.blockImprovedItems) {
+            if (list->HasType(T::kHealth)) return "improved";
+            if (list->HasType(T::kPoison)) return "poisoned";
+        }
         return nullptr;
+    }
+
+    // True if the game marks this inventory entry as a quest object (tracked by a quest alias).
+    template <class E>
+    bool EntryIsQuestObject(E* entry)
+    {
+        if constexpr (requires { entry->IsQuestObject(); }) {
+            return entry && entry->IsQuestObject();
+        } else {
+            return false;
+        }
     }
 
     // Looks for a unit of the item that can be swapped. outList stays null for a plain unit,
@@ -1101,6 +1144,14 @@ namespace
                     harmless = list;
                 }
             }
+        }
+        if (blockedBy && std::string_view(blockedBy) == "quest item") {
+            if (whyNot) *whyNot = "quest item";
+            return false;
+        }
+        if (EntryIsQuestObject(entry)) {
+            if (whyNot) *whyNot = "quest item";
+            return false;
         }
         if (harmless) {
             outList = harmless;
@@ -1151,6 +1202,10 @@ namespace
         auto* weap = form ? form->As<RE::TESObjectWEAP>() : nullptr;
         auto* armo = form ? form->As<RE::TESObjectARMO>() : nullptr;
 
+        if (IsBlacklisted(form)) {
+            Log("  ignored (item is on the blacklist).");
+            return false;
+        }
         const bool okWeap = weap && g_cfg.affectWeapons && IsEligible(weap);
         const bool okArmo = armo && IsEligibleArmor(armo);
         if (!player || (!okWeap && !okArmo)) {
@@ -1342,12 +1397,16 @@ namespace
             Toast("Only weapons and armor can be appraised.");
             return;
         }
+        if (IsBlacklisted(obj)) {
+            Toast("This item is on the blacklist and cannot be appraised.");
+            return;
+        }
         {
             RE::ExtraDataList* l = nullptr;
             std::string        why;
             if (!FindRemovable(player, obj, l, &why)) {
                 Log("Appraiser: item {:08X} refused: {}.", id, why);
-                Toast("This item cannot be appraised right now (it is equipped, or blocked by your settings).");
+                Toast(why == "quest item" ? "Quest items cannot be appraised." : "This item cannot be appraised right now (it is equipped, or blocked by your settings).");
                 return;
             }
         }
@@ -1625,8 +1684,9 @@ namespace
             ImGuiMCP::Checkbox("Result window when APPRAISING (always shown, any rarity)", &g_cfg.appraiseWindow);
             ImGuiMCP::TextWrapped("Key: code %d (AppraiseKey in the .ini; 24 = O, 25 = P, 0 disables). "
                                   "Typing that letter in the inventory search box also triggers it.", g_cfg.appraiseKey);
-            ImGuiMCP::Checkbox("Block items that would lose data (improved, stolen, enchanted by you, renamed)", &g_cfg.blockLossyItems);
-            ImGuiMCP::TextWrapped("Never appraises: items that already have a rarity, or equipped items. With the option above off, improved, stolen, renamed or player-enchanted items are appraised and lose that data. Enchantments that come with the item (from the game or a mod) are kept.");
+            ImGuiMCP::Checkbox("Block stolen, renamed and player-enchanted items (that data would be lost)", &g_cfg.blockLossyItems);
+            ImGuiMCP::Checkbox("Also block improved and poisoned items", &g_cfg.blockImprovedItems);
+            ImGuiMCP::TextWrapped("Never appraises: items that already have a rarity, equipped items, quest items, or items on the Blacklist (.ini). With an option above off, those items are appraised and lose that data. Enchantments that come with the item (from the game or a mod) are kept.");
         }
         ImGuiMCP::Separator();
 
