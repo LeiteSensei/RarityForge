@@ -514,6 +514,8 @@ namespace
             base->weaponData.speed, clone->weaponData.speed,
             clone->numKeywords,
             clone->GetModel() ? clone->GetModel() : "(no model)");
+        Log("  form check: type base={} copy={}, flags base=0x{:08X} copy=0x{:08X}",
+            static_cast<int>(base->GetFormType()), static_cast<int>(clone->GetFormType()), base->formFlags, clone->formFlags);
         g_built.insert(clone->GetFormID());
         return true;
     }
@@ -744,6 +746,8 @@ namespace
             base->value, clone->value,
             base->weight, clone->weight,
             clone->numKeywords);
+        Log("  form check: type base={} copy={}, flags base=0x{:08X} copy=0x{:08X}",
+            static_cast<int>(base->GetFormType()), static_cast<int>(clone->GetFormType()), base->formFlags, clone->formFlags);
         g_built.insert(clone->GetFormID());
         return true;
     }
