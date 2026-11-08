@@ -514,6 +514,9 @@ namespace
             base->weaponData.speed, clone->weaponData.speed,
             clone->numKeywords,
             clone->GetModel() ? clone->GetModel() : "(no model)");
+        // The original has form flag 0x1 set (the one the game's crash logger names "destructible") and the copy did not.
+        // This is an experiment for mods that inspect forms (e.g. Immersive Equipment Displays).
+        clone->formFlags |= (base->formFlags & 0x1u);
         Log("  form check: type base={} copy={}, flags base=0x{:08X} copy=0x{:08X}",
             static_cast<int>(base->GetFormType()), static_cast<int>(clone->GetFormType()), base->formFlags, clone->formFlags);
         g_built.insert(clone->GetFormID());
@@ -746,6 +749,9 @@ namespace
             base->value, clone->value,
             base->weight, clone->weight,
             clone->numKeywords);
+        // The original has form flag 0x1 set (the one the game's crash logger names "destructible") and the copy did not.
+        // This is an experiment for mods that inspect forms (e.g. Immersive Equipment Displays).
+        clone->formFlags |= (base->formFlags & 0x1u);
         Log("  form check: type base={} copy={}, flags base=0x{:08X} copy=0x{:08X}",
             static_cast<int>(base->GetFormType()), static_cast<int>(clone->GetFormType()), base->formFlags, clone->formFlags);
         g_built.insert(clone->GetFormID());
